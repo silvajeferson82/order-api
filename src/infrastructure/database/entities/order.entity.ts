@@ -6,12 +6,11 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
-import { OrderItem } from './order-item.entity';
-
-export type OrderStatus = 'PENDING' | 'PROCESSED' | 'FAILED';
+import type { OrderStatus } from '../../../domain/orders/order';
+import { OrderItemEntity } from './order-item.entity';
 
 @Entity('orders')
-export class Order {
+export class OrderEntity {
   @PrimaryGeneratedColumn()
   id: number;
 
@@ -27,11 +26,10 @@ export class Order {
   @Column({ type: 'text', nullable: true })
   failureReason: string | null;
 
-  @OneToMany(() => OrderItem, (item) => item.order, {
+  @OneToMany(() => OrderItemEntity, (item) => item.order, {
     cascade: true,
-    eager: true,
   })
-  items: OrderItem[];
+  items: OrderItemEntity[];
 
   @CreateDateColumn()
   createdAt: Date;

@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { Channel, ChannelModel } from 'amqplib';
 import { OrderCreatedEvent } from '../application/ports/order-event-publisher.port';
 
@@ -8,37 +9,44 @@ export class OrderQueuePublisher implements OnModuleInit {
   private connection: ChannelModel | null = null;
   private channel: Channel | null = null;
 
+  constructor(private readonly config: ConfigService) {}
+
   async onModuleInit(): Promise<void> {
-    if (process.env.RABBITMQ_ENABLED === 'false') {
-      this.logger.warn(
-        'RabbitMQ desabilitado. O pedido será salvo sem publicação em fila.',
-      );
+    const enabled = this.config.get<boolean | string>(
+      'RABBITMQ_ENABLED',
+      false,
+    );
+    if (enabled !== true && enabled !== 'true') {
+      this.logger.warn('RabbitMQ desabilitado.');
       return;
     }
+    const url = this.config.getOrThrow<string>('RABBITMQ_URL');
+    const amqp = await import('amqplib');
+    this.connection = await amqp.connect(url);
+    this.channel = await this.connection.createChannel();
+    await this.channel.assertExchange('order.created.dlq', 'fanout', {
+      durable: true,
+    });
+    await this.channel.assertQueue('order.created', {
+      durable: true,
+      deadLetterExchange: 'order.created.dlq',
+    });
+    await this.channel.assertQueue('order.created.dlq', { durable: true });
+    await this.channel.bindQueue('order.created.dlq', 'order.created.dlq', '');
+    this.logger.log('Conectado ao RabbitMQ');
+  }
 
-    try {
-      const amqp = await import('amqplib');
-      this.connection = await amqp.connect(
-        process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672',
-      );
-      this.channel = await this.connection.createChannel();
-      await this.channel.assertQueue('order.created', { durable: true });
-      this.logger.log('Conectado ao RabbitMQ');
-    } catch {
-      this.logger.warn(
-        'RabbitMQ indisponível; a fila ficou inativa para esta execução.',
-      );
-    }
+  getChannel(): Channel | null {
+    return this.channel;
   }
 
   publishOrderCreated(event: OrderCreatedEvent): void {
     if (!this.channel) {
       this.logger.warn(
-        `Mensagem de pedido ${event.orderId} não publicada em fila. RabbitMQ indisponível.`,
+        `Pedido ${event.orderId} não publicado: fila indisponível.`,
       );
       return;
     }
-
     this.channel.sendToQueue(
       'order.created',
       Buffer.from(JSON.stringify(event)),

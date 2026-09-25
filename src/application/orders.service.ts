@@ -1,12 +1,17 @@
-import { Inject, Injectable, NotFoundException } from '@nestjs/common';
-import { ORDER_EVENT_PUBLISHER } from '../application/ports/order-event-publisher.port';
-import type { OrderEventPublisher } from '../application/ports/order-event-publisher.port';
-import { ORDER_REPOSITORY } from '../application/ports/order-repository.port';
-import type { OrderRepository } from '../application/ports/order-repository.port';
-import { PRODUCT_REPOSITORY } from '../application/ports/product-repository.port';
-import type { ProductRepository } from '../application/ports/product-repository.port';
-import { CreateOrderDto, CreateOrderItemDto } from './create-order.dto';
-import { Order, OrderStatus } from './order.entity';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { ORDER_EVENT_PUBLISHER } from './ports/order-event-publisher.port';
+import type { OrderEventPublisher } from './ports/order-event-publisher.port';
+import { ORDER_REPOSITORY } from '../domain/orders/order-repository';
+import type { OrderRepository } from '../domain/orders/order-repository';
+import { PRODUCT_REPOSITORY } from '../domain/products/product-repository';
+import type { ProductRepository } from '../domain/products/product-repository';
+import type { Order, OrderStatus } from '../domain/orders/order';
+import type { CreateOrderCommand } from './orders/create-order.command';
 
 @Injectable()
 export class OrdersService {
@@ -19,12 +24,12 @@ export class OrdersService {
     private readonly orderEventPublisher: OrderEventPublisher,
   ) {}
 
-  calculateTotal(items: CreateOrderItemDto[]): number {
+  calculateTotal(items: CreateOrderCommand['items']): number {
     return items.reduce((sum, item) => sum + item.quantity * item.price, 0);
   }
 
   private async ensureProductsExist(
-    items: CreateOrderItemDto[],
+    items: CreateOrderCommand['items'],
   ): Promise<void> {
     for (const item of items) {
       const existingProduct = await this.productRepository.findByName(
@@ -33,31 +38,20 @@ export class OrdersService {
 
       if (!existingProduct) {
         await this.productRepository.save(
-          this.productRepository.create({
-            name: item.productName,
-            stock: 5,
-          }),
+          this.productRepository.create({ name: item.productName, stock: 5 }),
         );
       }
     }
   }
 
-  async create(createOrderDto: CreateOrderDto): Promise<Order> {
-    await this.ensureProductsExist(createOrderDto.items);
-
-    const total = this.calculateTotal(createOrderDto.items);
-
+  async create(command: CreateOrderCommand): Promise<Order> {
+    await this.ensureProductsExist(command.items);
     const order = this.orderRepository.create({
-      customerName: createOrderDto.customerName,
-      total,
+      customerName: command.customerName,
+      total: this.calculateTotal(command.items),
       status: 'PENDING',
-      items: createOrderDto.items.map((item) => ({
-        productName: item.productName,
-        quantity: item.quantity,
-        price: item.price,
-      })),
+      items: command.items.map((item) => ({ ...item })),
     });
-
     const savedOrder = await this.orderRepository.save(order);
 
     this.orderEventPublisher.publishOrderCreated({
@@ -78,21 +72,27 @@ export class OrdersService {
     page = 1,
     limit = 10,
   ): Promise<{ data: Order[]; total: number; page: number; limit: number }> {
+    if (
+      !Number.isInteger(page) ||
+      page < 1 ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 100
+    ) {
+      throw new BadRequestException('Paginação inválida');
+    }
     const [data, total] = await this.orderRepository.findAll(
       (page - 1) * limit,
       limit,
     );
-
     return { data, total, page, limit };
   }
 
   async findOne(id: number): Promise<Order> {
     const order = await this.orderRepository.findOne(id, true);
-
     if (!order) {
       throw new NotFoundException(`Pedido ${id} não encontrado`);
     }
-
     return order;
   }
 
@@ -101,38 +101,16 @@ export class OrdersService {
     status: OrderStatus,
     failureReason?: string,
   ): Promise<Order> {
-    const order = await this.orderRepository.findOne(orderId);
-
+    const order = await this.orderRepository.findOne(orderId, true);
     if (!order) {
       throw new NotFoundException(`Pedido ${orderId} não encontrado`);
     }
-
     order.status = status;
     order.failureReason = failureReason ?? null;
-
     return this.orderRepository.save(order);
   }
 
   async reserveProductsForOrder(orderId: number): Promise<void> {
-    const order = await this.orderRepository.findOne(orderId, true);
-
-    if (!order) {
-      throw new NotFoundException(`Pedido ${orderId} não encontrado`);
-    }
-
-    for (const item of order.items) {
-      const product = await this.productRepository.findByName(item.productName);
-
-      if (!product) {
-        throw new Error(`Produto ${item.productName} não encontrado`);
-      }
-
-      if (product.stock < item.quantity) {
-        throw new Error('estoque insuficiente');
-      }
-
-      product.stock -= item.quantity;
-      await this.productRepository.save(product);
-    }
+    await this.orderRepository.reserveAndProcess(orderId);
   }
 }

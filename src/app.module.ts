@@ -2,13 +2,10 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DataSourceOptions } from 'typeorm';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
-import { Order } from './orders/order.entity';
-import { OrderItem } from './orders/order-item.entity';
-import { OrdersModule } from './orders/orders.module';
-import { Product } from './products/product.entity';
-import { OrderQueueModule } from './queue/order-queue.module';
+import { OrderEntity } from './infrastructure/database/entities/order.entity';
+import { OrderItemEntity } from './infrastructure/database/entities/order-item.entity';
+import { ProductEntity } from './infrastructure/database/entities/product.entity';
+import { OrdersModule } from './modules/orders.module';
 
 @Module({
   imports: [
@@ -24,7 +21,7 @@ import { OrderQueueModule } from './queue/order-queue.module';
             : 'mysql';
 
         const commonOptions = {
-          entities: [Order, OrderItem, Product],
+          entities: [OrderEntity, OrderItemEntity, ProductEntity],
           synchronize: configService.get<string>('NODE_ENV') !== 'production',
           autoLoadEntities: true,
           dropSchema: configService.get<string>('NODE_ENV') === 'test',
@@ -63,9 +60,6 @@ import { OrderQueueModule } from './queue/order-queue.module';
       },
     }),
     OrdersModule,
-    OrderQueueModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}

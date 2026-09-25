@@ -5,6 +5,7 @@ import { DataSourceOptions } from 'typeorm';
 import { OrderEntity } from './infrastructure/database/entities/order.entity';
 import { OrderItemEntity } from './infrastructure/database/entities/order-item.entity';
 import { ProductEntity } from './infrastructure/database/entities/product.entity';
+import { OutboxEventEntity } from './infrastructure/database/entities/outbox-event.entity';
 import { OrdersModule } from './modules/orders.module';
 
 @Module({
@@ -21,10 +22,19 @@ import { OrdersModule } from './modules/orders.module';
             : 'mysql';
 
         const commonOptions = {
-          entities: [OrderEntity, OrderItemEntity, ProductEntity],
-          synchronize: configService.get<string>('NODE_ENV') !== 'production',
+          entities: [
+            OrderEntity,
+            OrderItemEntity,
+            ProductEntity,
+            OutboxEventEntity,
+          ],
+          synchronize:
+            dbType === 'better-sqlite3' &&
+            configService.get<string>('NODE_ENV') !== 'production',
           autoLoadEntities: true,
-          dropSchema: configService.get<string>('NODE_ENV') === 'test',
+          dropSchema:
+            dbType === 'better-sqlite3' &&
+            configService.get<string>('NODE_ENV') === 'test',
           logging: false,
         };
 

@@ -8,5 +8,5 @@ export type OrderCreatedEvent = {
 export const ORDER_EVENT_PUBLISHER = Symbol('ORDER_EVENT_PUBLISHER');
 
 export interface OrderEventPublisher {
-  publishOrderCreated(event: OrderCreatedEvent): void;
+  publishOrderCreated(event: OrderCreatedEvent): Promise<void>;
 }

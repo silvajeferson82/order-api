@@ -1,9 +1,17 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import type { ConsumeMessage } from 'amqplib';
+import {
+  NotFoundException,
+  Injectable,
+  Logger,
+  OnModuleInit,
+} from '@nestjs/common';
+import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
 import { OrdersService } from '../application/orders.service';
 import { OrderQueuePublisher } from './rabbitmq.service';
-
-const MAX_RETRIES = 3;
+import {
+  classifyProcessingFailure,
+  InvalidOrderEventError,
+  retryQueueFor,
+} from './retry-policy';
 
 @Injectable()
 export class OrderConsumerService implements OnModuleInit {
@@ -14,25 +22,29 @@ export class OrderConsumerService implements OnModuleInit {
     private readonly queue: OrderQueuePublisher,
   ) {}
 
-  async onModuleInit(): Promise<void> {
-    const channel = this.queue.getChannel();
-    if (!channel) return;
+  onModuleInit(): void {
+    this.queue.registerConsumer((channel) => this.startConsumer(channel));
+  }
+
+  private async startConsumer(channel: ConfirmChannel): Promise<void> {
     await channel.prefetch(1);
     await channel.consume('order.created', (message) => {
-      void this.processMessage(message);
+      void this.processMessage(message, channel);
     });
   }
 
-  private async processMessage(message: ConsumeMessage | null): Promise<void> {
+  private async processMessage(
+    message: ConsumeMessage | null,
+    channel: ConfirmChannel,
+  ): Promise<void> {
     if (!message) return;
-    const channel = this.queue.getChannel();
-    if (!channel) return;
+    if (channel !== this.queue.getChannel()) return;
     let orderId: number | null = null;
     try {
       const payload = parseOrderCreatedMessage(message);
       orderId = payload.orderId;
       const order = await this.ordersService.findOne(orderId);
-      if (order.status === 'PROCESSED') {
+      if (order.status === 'PROCESSED' || order.status === 'FAILED') {
         channel.ack(message);
         return;
       }
@@ -41,24 +53,55 @@ export class OrderConsumerService implements OnModuleInit {
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : 'erro desconhecido';
-      const retries = Number(
-        message.properties.headers?.['x-retry-count'] ?? 0,
+      let classification = classifyProcessingFailure(error);
+      if (classification === 'PERMANENT' && orderId !== null) {
+        try {
+          await this.ordersService.updateOrderStatus(orderId, 'FAILED', reason);
+        } catch (statusError) {
+          // A falha ao persistir o resultado é transitória: não descarte a mensagem.
+          classification =
+            statusError instanceof NotFoundException
+              ? 'PERMANENT'
+              : 'TRANSIENT';
+        }
+      }
+      const retries = parseRetryCount(
+        message.properties.headers?.['x-retry-count'],
       );
-      if (retries < MAX_RETRIES) {
-        channel.sendToQueue('order.created', message.content, {
-          persistent: true,
-          headers: {
+      const retryQueue =
+        classification === 'TRANSIENT' ? retryQueueFor(retries) : null;
+      if (retryQueue) {
+        try {
+          await this.queue.publishRetry(retryQueue, message.content, {
             ...message.properties.headers,
             'x-retry-count': retries + 1,
-          },
-        });
-        channel.ack(message);
-      } else {
-        if (orderId !== null) {
-          await this.ordersService.updateOrderStatus(orderId, 'FAILED', reason);
+          });
+          channel.ack(message);
+          return;
+        } catch (publishError) {
+          this.logger.error(
+            `Não foi possível publicar retry: ${errorMessage(publishError)}`,
+          );
+          channel.nack(message, false, true);
+          return;
         }
-        channel.nack(message, false, false);
       }
+      if (classification === 'TRANSIENT' && orderId !== null) {
+        try {
+          await this.ordersService.updateOrderStatus(orderId, 'FAILED', reason);
+        } catch (statusError) {
+          if (statusError instanceof NotFoundException) {
+            channel.nack(message, false, false);
+            return;
+          }
+          this.logger.error(
+            `Não foi possível marcar pedido ${orderId} como FAILED: ${errorMessage(statusError)}`,
+          );
+          channel.nack(message, false, true);
+          return;
+        }
+      }
+      channel.nack(message, false, false);
       this.logger.error(
         `Pedido ${orderId ?? 'desconhecido'} falhou: ${reason}`,
       );
@@ -71,7 +114,12 @@ type OrderCreatedMessage = { orderId: number };
 function parseOrderCreatedMessage(
   message: ConsumeMessage,
 ): OrderCreatedMessage {
-  const value: unknown = JSON.parse(message.content.toString());
+  let value: unknown;
+  try {
+    value = JSON.parse(message.content.toString());
+  } catch {
+    throw new InvalidOrderEventError();
+  }
   if (
     typeof value !== 'object' ||
     value === null ||
@@ -80,7 +128,16 @@ function parseOrderCreatedMessage(
     !Number.isInteger(value.orderId) ||
     value.orderId < 1
   ) {
-    throw new Error('Evento order.created inválido');
+    throw new InvalidOrderEventError();
   }
   return { orderId: value.orderId };
+}
+
+function parseRetryCount(value: unknown): number {
+  const parsed = Number(value ?? 0);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'erro desconhecido';
 }

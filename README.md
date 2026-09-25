@@ -16,8 +16,7 @@ docker compose ps
 ```
 
 O Compose aguarda o MySQL e o RabbitMQ ficarem saudáveis, executa as migrations
-no serviço `migrate` e só então inicia a API. A API também possui healthcheck
-HTTP em `GET /`.
+no serviço `migrate` e só então inicia a API. O healthcheck do container verifica que a porta da API está aceitando conexões TCP; a API não expõe uma rota de saúde.
 
 Portas publicadas no host:
 
@@ -54,26 +53,48 @@ Não execute `migration:revert` sem confirmar o impacto no banco.
 
 ## Testes isolados
 
-O perfil `test` usa uma imagem com dependências de desenvolvimento, um serviço
-MySQL separado (`mysql-test`) e um volume separado. O serviço de testes usa
-`NODE_ENV=test`, `dropSchema=true` e RabbitMQ desabilitado, portanto não
-reutiliza os dados da API. Ele executa lint, build e testes unitários:
+O perfil `test` sobe MySQL e RabbitMQ dedicados, sem volumes persistentes. O
+runner aplica as migrations reais, executa lint/build/testes unitários e a
+aceitação que inicia a aplicação conectada aos dois serviços. Os testes cobrem
+o pedido de ponta a ponta, rollback de múltiplos itens, concorrência no MySQL,
+reentrega e DLQ:
 
 ```bash
-docker compose --profile test run --rm test
-# Para o E2E, após a configuração de módulos do Jest ser alinhada:
+npm run test:acceptance:compose
+```
+
+O comando usa o projeto Compose isolado `order-api-p0-acceptance` e remove,
+inclusive em caso de falha, seus containers, rede e volumes temporários sem
+tocar nos volumes da stack de desenvolvimento. Pode ser repetido. Para rodar
+somente a suíte unitária/E2E SQLite existente localmente:
+
+```bash
+npm test -- --runInBand
 npm run test:e2e -- --runInBand
 ```
 
-Para remover o banco de testes:
+O comando `npm run test:acceptance` requer MySQL migrado e RabbitMQ real
+acessíveis via `DB_TYPE=mysql`, `DB_HOST`, `DB_PORT`, `DB_USERNAME`,
+`DB_PASSWORD`, `DB_NAME`, `RABBITMQ_ENABLED=true` e `RABBITMQ_URL`; sem esses
+serviços ele falha intencionalmente em vez de simular a aceitação.
 
-```bash
-docker compose --profile test down -v
-```
+## Publicação confiável e processamento
 
-Os testes unitários também podem ser executados localmente com
-`npm ci && npm test -- --runInBand`; essa modalidade usa a configuração
-existente do projeto e não valida conectividade Docker.
+O `POST /orders` grava o pedido e o evento `order.created` na tabela outbox na
+mesma transação MySQL. Um dispatcher tenta publicar a outbox periodicamente
+usando um canal RabbitMQ de publisher confirms e somente marca o registro como
+publicado após confirmação do broker. Se a aplicação cair entre confirmação e
+marcação, pode haver republicação; o consumer é idempotente pelo estado do
+pedido e serializa a reserva usando lock transacional no MySQL.
+
+Falhas transitórias usam três filas RabbitMQ com TTL de 1, 5 e 15 segundos
+antes de retornarem à fila principal. Falhas permanentes (por exemplo, estoque
+insuficiente ou evento inválido) não são repetidas e são encaminhadas à DLQ.
+Falha transitória que exceda as três tentativas marca o pedido como `FAILED` e
+é encaminhada à DLQ. Mensagens só são confirmadas após persistir o resultado
+ou confirmar a publicação no retry; a semântica é at-least-once, não
+exactly-once. Consulte `docker compose logs -f api` para erros de dispatch e
+consumer. Não há painel/alerta operacional configurado.
 
 ## Desenvolvimento sem Docker
 
@@ -89,7 +110,6 @@ leve de testes, defina `DB_TYPE=better-sqlite3`, `DB_NAME=:memory:` e
 
 ## Endpoints
 
-- `GET /`
 - `POST /orders`
 - `GET /orders/:id`
 - `GET /orders?page=1&limit=10`

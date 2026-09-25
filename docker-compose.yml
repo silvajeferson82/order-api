@@ -78,7 +78,7 @@ services:
           'CMD',
           'node',
           '-e',
-          "require('http').get('http://127.0.0.1:3000/',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+          "const net=require('node:net');const socket=net.connect(3000,'127.0.0.1',()=>{socket.end();process.exit(0)});socket.on('error',()=>process.exit(1))",
         ]
       interval: 10s
       timeout: 5s
@@ -93,13 +93,12 @@ services:
   mysql-test:
     image: mysql:8.0
     profiles: ['test']
+    command: ['--innodb-lock-wait-timeout=1']
     environment:
       MYSQL_ROOT_PASSWORD: testroot
       MYSQL_DATABASE: order_db_test
       MYSQL_USER: test
       MYSQL_PASSWORD: test
-    volumes:
-      - mysql_test_data:/var/lib/mysql
     healthcheck:
       test:
         [
@@ -110,6 +109,19 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
+
+  rabbitmq-test:
+    image: rabbitmq:3.13-management
+    profiles: ['test']
+    environment:
+      RABBITMQ_DEFAULT_USER: test
+      RABBITMQ_DEFAULT_PASS: test
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
 
   test:
     profiles: ['test']
@@ -124,15 +136,20 @@ services:
       DB_USERNAME: test
       DB_PASSWORD: test
       DB_NAME: order_db_test
-      RABBITMQ_ENABLED: 'false'
-      NODE_OPTIONS: --experimental-require-module
+      RABBITMQ_ENABLED: 'true'
+      RABBITMQ_URL: amqp://test:test@rabbitmq-test:5672
     command:
-      ['sh', '-c', 'npm run lint && npm run build && npm test -- --runInBand']
+      [
+        'sh',
+        '-c',
+        'npm run lint && npm run build && npm run migration:run:dev && npm test -- --runInBand && npm run test:acceptance -- --runInBand',
+      ]
     depends_on:
       mysql-test:
+        condition: service_healthy
+      rabbitmq-test:
         condition: service_healthy
 
 volumes:
   mysql_data:
   rabbitmq_data:
-  mysql_test_data:

@@ -4,8 +4,12 @@ import type { Order, OrderDraft } from '../../domain/orders/order';
 import type { OrderRepository } from '../../domain/orders/order-repository';
 import { OrderEntity } from '../database/entities/order.entity';
 import { ProductEntity } from '../database/entities/product.entity';
+import { OutboxEventEntity } from '../database/entities/outbox-event.entity';
 import type { OrderSaveInput } from '../../domain/orders/order';
 import { toOrder, toOrderEntity, toOrderDraft } from './order.mapper';
+import { InsufficientStockError } from '../../domain/products/insufficient-stock.error';
+import { randomUUID } from 'node:crypto';
+import { NotFoundException } from '@nestjs/common';
 
 export class TypeOrmOrderRepository implements OrderRepository {
   constructor(
@@ -19,7 +23,32 @@ export class TypeOrmOrderRepository implements OrderRepository {
   }
 
   async save(order: OrderSaveInput) {
-    const saved = await this.repository.save(toOrderEntity(order));
+    if ('id' in order) {
+      const saved = await this.repository.save(toOrderEntity(order));
+      return toOrder(saved);
+    }
+
+    const saved = await this.dataSource.transaction(async (manager) => {
+      const orderEntity = await manager
+        .getRepository(OrderEntity)
+        .save(toOrderEntity(order));
+      const event = {
+        orderId: orderEntity.id,
+        customerName: orderEntity.customerName,
+        total: Number(orderEntity.total),
+        items: orderEntity.items.map((item) => ({
+          productName: item.productName,
+          quantity: item.quantity,
+          price: Number(item.price),
+        })),
+      };
+      await manager.getRepository(OutboxEventEntity).insert({
+        eventId: randomUUID(),
+        eventType: 'order.created',
+        payload: event,
+      });
+      return orderEntity;
+    });
     return toOrder(saved);
   }
 
@@ -48,8 +77,8 @@ export class TypeOrmOrderRepository implements OrderRepository {
         relations: ['items'],
         lock: { mode: 'pessimistic_write' },
       });
-      if (!order) throw new Error(`Pedido ${id} não encontrado`);
-      if (order.status === 'PROCESSED') return;
+      if (!order) throw new NotFoundException(`Pedido ${id} não encontrado`);
+      if (order.status === 'PROCESSED' || order.status === 'FAILED') return;
 
       for (const item of order.items) {
         const result = await manager
@@ -62,7 +91,7 @@ export class TypeOrmOrderRepository implements OrderRepository {
           })
           .execute();
         if (result.affected !== 1) {
-          throw new Error(`Estoque insuficiente para ${item.productName}`);
+          throw new InsufficientStockError(item.productName);
         }
       }
       await manager.update(OrderEntity, id, {

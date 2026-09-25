@@ -4,8 +4,6 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ORDER_EVENT_PUBLISHER } from './ports/order-event-publisher.port';
-import type { OrderEventPublisher } from './ports/order-event-publisher.port';
 import { ORDER_REPOSITORY } from '../domain/orders/order-repository';
 import type { OrderRepository } from '../domain/orders/order-repository';
 import { PRODUCT_REPOSITORY } from '../domain/products/product-repository';
@@ -20,8 +18,6 @@ export class OrdersService {
     private readonly orderRepository: OrderRepository,
     @Inject(PRODUCT_REPOSITORY)
     private readonly productRepository: ProductRepository,
-    @Inject(ORDER_EVENT_PUBLISHER)
-    private readonly orderEventPublisher: OrderEventPublisher,
   ) {}
 
   calculateTotal(items: CreateOrderCommand['items']): number {
@@ -53,17 +49,6 @@ export class OrdersService {
       items: command.items.map((item) => ({ ...item })),
     });
     const savedOrder = await this.orderRepository.save(order);
-
-    this.orderEventPublisher.publishOrderCreated({
-      orderId: savedOrder.id,
-      customerName: savedOrder.customerName,
-      total: savedOrder.total,
-      items: savedOrder.items.map((item) => ({
-        productName: item.productName,
-        quantity: item.quantity,
-        price: Number(item.price),
-      })),
-    });
 
     return savedOrder;
   }

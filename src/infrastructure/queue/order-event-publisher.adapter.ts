@@ -9,7 +9,7 @@ import { OrderQueuePublisher } from '../../queue/rabbitmq.service';
 export class OrderEventPublisherAdapter implements OrderEventPublisher {
   constructor(private readonly publisher: OrderQueuePublisher) {}
 
-  publishOrderCreated(event: OrderCreatedEvent): void {
-    this.publisher.publishOrderCreated(event);
+  publishOrderCreated(event: OrderCreatedEvent): Promise<void> {
+    return this.publisher.publishOrderCreated(event);
   }
 }

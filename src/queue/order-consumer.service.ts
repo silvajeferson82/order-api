@@ -1,66 +1,64 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import type { Channel, ChannelModel, ConsumeMessage } from 'amqplib';
-import { OrdersService } from '../orders/orders.service';
+import type { ConsumeMessage } from 'amqplib';
+import { OrdersService } from '../application/orders.service';
+import { OrderQueuePublisher } from './rabbitmq.service';
+
+const MAX_RETRIES = 3;
 
 @Injectable()
 export class OrderConsumerService implements OnModuleInit {
   private readonly logger = new Logger(OrderConsumerService.name);
-  private channel: Channel | null = null;
 
-  constructor(private readonly ordersService: OrdersService) {}
+  constructor(
+    private readonly ordersService: OrdersService,
+    private readonly queue: OrderQueuePublisher,
+  ) {}
 
   async onModuleInit(): Promise<void> {
-    if (process.env.RABBITMQ_ENABLED === 'false') {
-      return;
-    }
-
-    try {
-      const amqp = await import('amqplib');
-      const connection: ChannelModel = await amqp.connect(
-        process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672',
-      );
-      this.channel = await connection.createChannel();
-      await this.channel.assertQueue('order.created', { durable: true });
-
-      await this.channel.consume(
-        'order.created',
-        (message: ConsumeMessage | null) => {
-          void this.processMessage(message);
-        },
-      );
-    } catch {
-      this.logger.warn(
-        'Consumer do RabbitMQ não iniciou. A execução seguirá sem fila ativa.',
-      );
-    }
+    const channel = this.queue.getChannel();
+    if (!channel) return;
+    await channel.prefetch(1);
+    await channel.consume('order.created', (message) => {
+      void this.processMessage(message);
+    });
   }
 
   private async processMessage(message: ConsumeMessage | null): Promise<void> {
-    if (!message) {
-      return;
-    }
-
+    if (!message) return;
+    const channel = this.queue.getChannel();
+    if (!channel) return;
     let orderId: number | null = null;
     try {
       const payload = parseOrderCreatedMessage(message);
       orderId = payload.orderId;
       const order = await this.ordersService.findOne(orderId);
-
       if (order.status === 'PROCESSED') {
-        this.channel?.ack(message);
+        channel.ack(message);
         return;
       }
-
       await this.ordersService.reserveProductsForOrder(order.id);
-      await this.ordersService.updateOrderStatus(order.id, 'PROCESSED');
-      this.channel?.ack(message);
+      channel.ack(message);
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : 'erro desconhecido';
-      if (orderId !== null) {
-        await this.ordersService.updateOrderStatus(orderId, 'FAILED', reason);
+      const retries = Number(
+        message.properties.headers?.['x-retry-count'] ?? 0,
+      );
+      if (retries < MAX_RETRIES) {
+        channel.sendToQueue('order.created', message.content, {
+          persistent: true,
+          headers: {
+            ...message.properties.headers,
+            'x-retry-count': retries + 1,
+          },
+        });
+        channel.ack(message);
+      } else {
+        if (orderId !== null) {
+          await this.ordersService.updateOrderStatus(orderId, 'FAILED', reason);
+        }
+        channel.nack(message, false, false);
       }
-      this.channel?.ack(message);
       this.logger.error(
         `Pedido ${orderId ?? 'desconhecido'} falhou: ${reason}`,
       );
@@ -68,23 +66,21 @@ export class OrderConsumerService implements OnModuleInit {
   }
 }
 
-type OrderCreatedMessage = {
-  orderId: number;
-};
+type OrderCreatedMessage = { orderId: number };
 
 function parseOrderCreatedMessage(
   message: ConsumeMessage,
 ): OrderCreatedMessage {
   const value: unknown = JSON.parse(message.content.toString());
-
   if (
     typeof value !== 'object' ||
     value === null ||
     !('orderId' in value) ||
-    typeof value.orderId !== 'number'
+    typeof value.orderId !== 'number' ||
+    !Number.isInteger(value.orderId) ||
+    value.orderId < 1
   ) {
     throw new Error('Evento order.created inválido');
   }
-
   return { orderId: value.orderId };
 }

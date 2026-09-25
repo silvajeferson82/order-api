@@ -1,23 +1,28 @@
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ProductRepository } from '../../application/ports/product-repository.port';
-import { Product } from '../../products/product.entity';
+import type { ProductRepository } from '../../domain/products/product-repository';
+import { ProductEntity } from '../database/entities/product.entity';
+import type { Product } from '../../domain/products/product';
+import type { ProductDraft } from '../../domain/products/product';
+import { toProduct, toProductDraft, toProductEntity } from './product.mapper';
 
 export class TypeOrmProductRepository implements ProductRepository {
   constructor(
-    @InjectRepository(Product)
-    private readonly repository: Repository<Product>,
+    @InjectRepository(ProductEntity)
+    private readonly repository: Repository<ProductEntity>,
   ) {}
 
-  findByName(name: string): Promise<Product | null> {
-    return this.repository.findOne({ where: { name } });
+  async findByName(name: string): Promise<Product | null> {
+    const entity = await this.repository.findOne({ where: { name } });
+    return entity ? toProduct(entity) : null;
   }
 
-  create(product: Partial<Product>): Product {
-    return this.repository.create(product);
+  create(product: ProductDraft): ProductDraft {
+    return toProductDraft(product);
   }
 
-  save(product: Product): Promise<Product> {
-    return this.repository.save(product);
+  async save(product: ProductDraft | Product): Promise<Product> {
+    const saved = await this.repository.save(toProductEntity(product));
+    return toProduct(saved);
   }
 }

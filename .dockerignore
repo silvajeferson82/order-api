@@ -5,6 +5,7 @@ coverage
 .github
 .env
 .env.*
+!.env.example
 *.log
 *.pdf
 Dockerfile*

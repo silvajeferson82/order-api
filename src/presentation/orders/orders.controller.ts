@@ -6,8 +6,10 @@ import {
   ParseIntPipe,
   Post,
   Query,
+  UseGuards,
 } from '@nestjs/common';
 import {
+  ApiBearerAuth,
   ApiBody,
   ApiExtraModels,
   ApiOperation,
@@ -15,6 +17,9 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { Roles } from '../../auth/roles.decorator';
+import { RolesGuard } from '../../auth/roles.guard';
+import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
 import { OrdersService } from '../../application/orders.service';
 import { CreateOrderDto } from './dtos/create-order.dto';
 import {
@@ -25,11 +30,14 @@ import { OrderPaginationDto } from './dtos/order-pagination.dto';
 
 @ApiExtraModels(OrderResponseDto, OrderListResponseDto)
 @ApiTags('Pedidos')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('orders')
 export class OrdersController {
   constructor(private readonly ordersService: OrdersService) {}
 
   @Post()
+  @Roles('order-admin')
   @ApiOperation({
     summary: 'Cria um pedido',
     description:
@@ -75,11 +83,14 @@ export class OrdersController {
     },
   })
   @ApiResponse({ status: 400, description: 'Dados de entrada inválidos.' })
+  @ApiResponse({ status: 401, description: 'Token ausente ou inválido.' })
+  @ApiResponse({ status: 403, description: 'Papel order-admin necessário.' })
   async create(@Body() dto: CreateOrderDto): Promise<OrderResponseDto> {
     return this.toResponse(await this.ordersService.create(dto));
   }
 
   @Get(':id')
+  @Roles('order-user')
   @ApiOperation({ summary: 'Busca um pedido por ID' })
   @ApiParam({ name: 'id', example: 1, type: Number })
   @ApiResponse({
@@ -106,6 +117,8 @@ export class OrdersController {
     },
   })
   @ApiResponse({ status: 404, description: 'Pedido não encontrado.' })
+  @ApiResponse({ status: 401, description: 'Token ausente ou inválido.' })
+  @ApiResponse({ status: 403, description: 'Papel order-user necessário.' })
   async findOne(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<OrderResponseDto> {
@@ -113,6 +126,7 @@ export class OrdersController {
   }
 
   @Get()
+  @Roles('order-user')
   @ApiOperation({ summary: 'Lista pedidos com paginação' })
   @ApiResponse({
     status: 200,
@@ -143,6 +157,8 @@ export class OrdersController {
       },
     },
   })
+  @ApiResponse({ status: 401, description: 'Token ausente ou inválido.' })
+  @ApiResponse({ status: 403, description: 'Papel order-user necessário.' })
   async findAll(
     @Query() pagination: OrderPaginationDto,
   ): Promise<OrderListResponseDto> {

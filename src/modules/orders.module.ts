@@ -13,9 +13,11 @@ import { TypeOrmProductRepository } from '../infrastructure/orders/typeorm-produ
 import { OrdersController } from '../presentation/orders/orders.controller';
 import { OrdersService } from '../application/orders.service';
 import { OutboxDispatcherService } from '../queue/outbox-dispatcher.service';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     TypeOrmModule.forFeature([
       OrderEntity,
       OrderItemEntity,

@@ -4,6 +4,7 @@ import { OrderEntity } from './entities/order.entity';
 import { OrderItemEntity } from './entities/order-item.entity';
 import { ProductEntity } from './entities/product.entity';
 import { OutboxEventEntity } from './entities/outbox-event.entity';
+import { OrderProcessingRunEntity } from './entities/order-processing-run.entity';
 
 export default new DataSource({
   type: 'mysql',
@@ -12,7 +13,13 @@ export default new DataSource({
   username: process.env.DB_USERNAME ?? 'root',
   password: process.env.DB_PASSWORD ?? 'root',
   database: process.env.DB_NAME ?? 'order_db',
-  entities: [OrderEntity, OrderItemEntity, ProductEntity, OutboxEventEntity],
+  entities: [
+    OrderEntity,
+    OrderItemEntity,
+    ProductEntity,
+    OutboxEventEntity,
+    OrderProcessingRunEntity,
+  ],
   migrations: [__dirname + '/migrations/*{.js,.ts}'],
   synchronize: false,
 });

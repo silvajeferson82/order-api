@@ -10,6 +10,8 @@ import { PRODUCT_REPOSITORY } from '../domain/products/product-repository';
 import type { ProductRepository } from '../domain/products/product-repository';
 import type { Order, OrderStatus } from '../domain/orders/order';
 import type { CreateOrderCommand } from './orders/create-order.command';
+import { OrderCreatedEvent } from '../domain/orders/events/order-created.event';
+import { OrderReprocessRequestedEvent } from '../domain/orders/events/order-reprocess-requested.event';
 
 @Injectable()
 export class OrdersService {
@@ -40,17 +42,42 @@ export class OrdersService {
     }
   }
 
-  async create(command: CreateOrderCommand): Promise<Order> {
+  async create(
+    command: CreateOrderCommand,
+    requestedBy?: string | null,
+  ): Promise<Order> {
     await this.ensureProductsExist(command.items);
     const order = this.orderRepository.create({
       customerName: command.customerName,
       total: this.calculateTotal(command.items),
       status: 'PENDING',
+      generation: 1,
+      processingRun: 1,
       items: command.items.map((item) => ({ ...item })),
     });
-    const savedOrder = await this.orderRepository.save(order);
+    return this.orderRepository.createWithEvent(
+      order,
+      (savedOrder) =>
+        new OrderCreatedEvent(
+          savedOrder.id,
+          savedOrder.generation,
+          savedOrder.processingRun,
+        ),
+      requestedBy,
+    );
+  }
 
-    return savedOrder;
+  async reprocess(id: number, requestedBy?: string | null): Promise<Order> {
+    return this.orderRepository.reprocessFailed(
+      id,
+      (savedOrder) =>
+        new OrderReprocessRequestedEvent(
+          savedOrder.id,
+          savedOrder.generation,
+          savedOrder.processingRun,
+        ),
+      requestedBy,
+    );
   }
 
   async findAll(
@@ -81,21 +108,52 @@ export class OrdersService {
     return order;
   }
 
-  async updateOrderStatus(
-    orderId: number,
-    status: OrderStatus,
-    failureReason?: string,
-  ): Promise<Order> {
-    const order = await this.orderRepository.findOne(orderId, true);
-    if (!order) {
-      throw new NotFoundException(`Pedido ${orderId} não encontrado`);
-    }
-    order.status = status;
-    order.failureReason = failureReason ?? null;
-    return this.orderRepository.save(order);
+  async reserveProductsForOrder(orderId: number): Promise<void> {
+    const order = await this.findOne(orderId);
+    await this.orderRepository.reserveAndProcess(
+      orderId,
+      order.generation,
+      order.processingRun,
+    );
   }
 
-  async reserveProductsForOrder(orderId: number): Promise<void> {
-    await this.orderRepository.reserveAndProcess(orderId);
+  async reserveGeneration(
+    orderId: number,
+    generation: number,
+    processingRun: number,
+  ): Promise<void> {
+    await this.orderRepository.reserveAndProcess(
+      orderId,
+      generation,
+      processingRun,
+    );
+  }
+
+  async startProcessingRun(
+    orderId: number,
+    generation: number,
+    processingRun: number,
+  ): Promise<boolean> {
+    return this.orderRepository.startProcessingRun(
+      orderId,
+      generation,
+      processingRun,
+    );
+  }
+
+  async updateOrderStatusForGeneration(
+    orderId: number,
+    generation: number,
+    processingRun: number,
+    status: OrderStatus,
+    failureReason?: string,
+  ): Promise<boolean> {
+    return this.orderRepository.updateStatusForGeneration(
+      orderId,
+      generation,
+      processingRun,
+      status,
+      failureReason,
+    );
   }
 }

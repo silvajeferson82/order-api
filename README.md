@@ -79,6 +79,14 @@ Keycloak nem usa tokens/chaves do ambiente. A configuração `AUTH_ENABLED=false
 dos testes unitários e da aceitação real é explícita e serve apenas para cobrir
 fluxos que não são testes de autenticação.
 
+O E2E cobre também o contrato de `POST /orders/:id/reprocess` (papel,
+`202`/`400`/`404`/`409` e gravação transacional da nova mensagem na outbox).
+A aceitação Compose com MySQL/RabbitMQ valida o reprocessamento de um pedido
+realmente `FAILED`, a conclusão da nova geração e o descarte de uma mensagem
+atrasada da geração anterior sem novo débito de estoque.
+Também confere o histórico de criação/falha/reprocessamento, sua correlação
+com as linhas da outbox e a atualização terminal da tentativa no MySQL.
+
 A flag `--legacy-peer-deps` também é usada no Dockerfile: `@nestjs/swagger@12`
 declara peer de NestJS 12, enquanto o projeto usa NestJS 11. Sem a flag, `npm ci`
 faz falhar a resolução de dependências.
@@ -114,6 +122,13 @@ publisher confirms; só então registra `publishedAt`. Falha de publicação
 mantém o evento pendente para nova tentativa. Há reconexão ao RabbitMQ e os
 erros de dispatch/consumer são enviados aos logs da aplicação.
 
+Os contratos de domínio `OrderCreatedEvent` e
+`OrderReprocessRequestedEvent` são versionados (`version: 1`) e não dependem de
+NestJS, TypeORM ou RabbitMQ. A aplicação cria esses eventos; a persistência
+grava o evento serializado na outbox na mesma transação que o pedido; somente o
+dispatcher conhece o publisher RabbitMQ. Portanto, o request não publica
+diretamente no broker e não há dual-write pedido/broker.
+
 A entrega é **at-least-once**, não exactly-once: uma queda depois do confirm do
 broker e antes da atualização da outbox pode causar publicação duplicada. O
 consumer reconhece pedidos já terminais (`PROCESSED`/`FAILED`) sem repetir a
@@ -121,6 +136,42 @@ reserva. A reserva roda em transação MySQL, serializa o processamento do pedid
 com lock e atualiza cada produto condicionalmente (`stock >= quantidade`). Se
 algum item não tiver saldo, toda a transação de reserva é revertida, inclusive
 as alterações dos itens anteriores, antes de registrar a falha do pedido.
+
+O pedido mantém `generation` e `processingRun`, ambos iniciados em `1`. O
+endpoint `POST /orders/:id/reprocess` exige `order-admin` e só aceita pedidos
+`FAILED`: sob lock pessimista no MySQL, muda o pedido para `PENDING`, limpa o
+motivo de falha, incrementa os dois contadores e grava o evento
+`order.reprocess.requested` na mesma transação. Retorna `202`; pedido
+inexistente retorna `404`, estado diferente de `FAILED` retorna `409` e ID
+malformado retorna `400`. Duas solicitações concorrentes são serializadas:
+apenas uma transição pode sair de `FAILED`, a outra observa `PENDING` e recebe
+`409`. A geração é incluída nas mensagens e o consumer confirma sem processar
+eventos de gerações antigas, inclusive mensagens atrasadas em retry. O estado
+e os contadores também são retornados nas consultas do pedido.
+
+Cada geração/processamento também tem uma linha persistente em
+`order_processing_runs`, com unicidade `(orderId, generation, processingRun)`.
+`source` distingue `CREATE` e `MANUAL`; `eventId` referencia o UUID da linha
+outbox correspondente e `eventType` registra o tipo publicado. A linha nasce
+como `PENDING` na mesma transação que grava pedido/reprocessamento e outbox.
+O consumer atualiza o estado terminal e `completedAt` da tentativa na mesma
+transação que atualiza o pedido; `startedAt` é preenchido na primeira entrega
+válida e retries não criam novas linhas nem reiniciam o horário. Pedidos
+anteriores à migration recebem uma linha inferida de seu estado e timestamps,
+sem `eventId` (não se inventa vínculo para uma mensagem que talvez não exista).
+`requestedBy` guarda somente o claim JWT `sub` na criação/reprocessamento
+quando presente; não armazena o token. Execuções sem identidade autenticada
+registram `NULL`. Não há endpoint de leitura do histórico nesta entrega.
+
+Em deploy progressivo, a migration cria tabela/índices e faz o backfill inicial
+sem alterar/remover colunas antigas. Binaries antigos continuam compatíveis
+com a tabela adicional, mas não gravam tentativas: após drenar todas as
+instâncias antigas, execute uma reconciliação idempotente para cobrir os
+pedidos eventualmente criados nesse intervalo (o mesmo `INSERT ... SELECT` do
+backfill, com `WHERE NOT EXISTS` pela chave única), antes de considerar a
+auditoria completa. Faça backup e monitore tempo/locks do backfill em bases
+grandes. O `down` remove exclusivamente a tabela nova e, portanto, descarta
+todo o histórico.
 
 Falhas de evento inválido, pedido inexistente e estoque insuficiente são
 permanentes: não são repetidas e seguem para a DLQ; quando há pedido, o motivo
@@ -136,8 +187,9 @@ a mensagem original. Depois das três tentativas adicionais, o pedido é marcado
   API podem publicar o mesmo evento pendente. O fluxo tolera redelivery, mas
   isso não substitui uma estratégia de coordenação para escalar dispatchers.
 - Há logs de erro, mas não estão configurados métricas, alertas, tracing,
-  painel operacional ou procedimento automatizado de inspeção/reprocessamento
-  da DLQ.
+  painel operacional ou procedimento automatizado de inspeção da DLQ. O novo
+  endpoint reprocessa somente pedidos cuja falha já foi persistida no banco;
+  ele não consome nem altera diretamente mensagens da DLQ.
 - Os atrasos de retry são fixos e o dispatch da outbox volta a tentar no ciclo
   seguinte; não há política operacional configurável nem retenção/limpeza da
   outbox documentada.
@@ -162,6 +214,7 @@ configuração de teste usa `DB_TYPE=better-sqlite3`, `DB_NAME=:memory:` e
 ## Endpoints
 
 - `POST /orders`
+- `POST /orders/:id/reprocess` (papel `order-admin`; somente estado `FAILED`)
 - `GET /orders/:id`
 - `GET /orders?page=1&limit=10`
 - Swagger: `/docs`
@@ -184,6 +237,7 @@ incorretos resulta em **401**; token válido sem papel requerido resulta em
 | `GET /orders`     | `order-user`         |
 | `GET /orders/:id` | `order-user`         |
 | `POST /orders`    | `order-admin`        |
+| `POST /orders/:id/reprocess` | `order-admin` |
 
 Os papéis são lidos exclusivamente de
 `resource_access.order-api.roles`. Não há autorização por propriedade/

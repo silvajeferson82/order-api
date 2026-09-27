@@ -7,6 +7,7 @@ import { OrderEntity } from './infrastructure/database/entities/order.entity';
 import { OrderItemEntity } from './infrastructure/database/entities/order-item.entity';
 import { ProductEntity } from './infrastructure/database/entities/product.entity';
 import { OutboxEventEntity } from './infrastructure/database/entities/outbox-event.entity';
+import { OrderProcessingRunEntity } from './infrastructure/database/entities/order-processing-run.entity';
 import { OrdersModule } from './modules/orders.module';
 
 @Module({
@@ -31,6 +32,7 @@ import { OrdersModule } from './modules/orders.module';
             OrderItemEntity,
             ProductEntity,
             OutboxEventEntity,
+            OrderProcessingRunEntity,
           ],
           synchronize:
             dbType === 'better-sqlite3' &&

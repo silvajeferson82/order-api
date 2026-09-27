@@ -6,7 +6,8 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, Repository } from 'typeorm';
-import { OrderCreatedEvent } from '../application/ports/order-event-publisher.port';
+import type { DomainEvent } from '../domain/orders/events/domain-event';
+import { OrderCreatedEvent } from '../domain/orders/events/order-created.event';
 import { OutboxEventEntity } from '../infrastructure/database/entities/outbox-event.entity';
 import { OrderQueuePublisher } from './rabbitmq.service';
 
@@ -45,14 +46,8 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
       });
       for (const record of pending) {
         try {
-          if (record.eventType !== 'order.created') {
-            throw new Error(
-              `Tipo de evento não suportado: ${record.eventType}`,
-            );
-          }
-          await this.publisher.publishOrderCreated(
-            record.payload as OrderCreatedEvent,
-          );
+          const event = domainEventFromOutbox(record.eventType, record.payload);
+          await this.publisher.publishDomainEvent(event);
           await this.outbox.update(
             { id: record.id, publishedAt: IsNull() },
             { publishedAt: new Date() },
@@ -72,6 +67,36 @@ export class OutboxDispatcherService implements OnModuleInit, OnModuleDestroy {
       this.dispatching = false;
     }
   }
+}
+
+function domainEventFromOutbox(
+  eventType: string,
+  payload: Record<string, unknown>,
+): DomainEvent {
+  if (
+    eventType === 'order.created' &&
+    payload.version === undefined &&
+    Number.isInteger(payload.orderId) &&
+    Number(payload.orderId) > 0
+  ) {
+    // Compatibilidade com mensagens criadas antes da adoção do contrato v1.
+    return new OrderCreatedEvent(Number(payload.orderId), 1, 1);
+  }
+  if (
+    (eventType === 'order.created' ||
+      eventType === 'order.reprocess.requested') &&
+    payload.eventType === eventType &&
+    payload.version === 1 &&
+    Number.isInteger(payload.orderId) &&
+    Number(payload.orderId) > 0 &&
+    Number.isInteger(payload.generation) &&
+    Number(payload.generation) > 0 &&
+    Number.isInteger(payload.processingRun) &&
+    Number(payload.processingRun) > 0
+  ) {
+    return payload as unknown as DomainEvent;
+  }
+  throw new Error(`Evento outbox inválido ou não suportado: ${eventType}`);
 }
 
 function messageOf(error: unknown): string {

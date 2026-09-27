@@ -8,6 +8,8 @@ import { AppModule } from '../src/app.module';
 import { OrderEntity } from '../src/infrastructure/database/entities/order.entity';
 import { OrderItemEntity } from '../src/infrastructure/database/entities/order-item.entity';
 import { ProductEntity } from '../src/infrastructure/database/entities/product.entity';
+import { OutboxEventEntity } from '../src/infrastructure/database/entities/outbox-event.entity';
+import { OrderProcessingRunEntity } from '../src/infrastructure/database/entities/order-processing-run.entity';
 import { OrdersService } from '../src/application/orders.service';
 import { OrderQueuePublisher } from '../src/queue/rabbitmq.service';
 
@@ -64,6 +66,25 @@ describe('aceitação real MySQL + RabbitMQ', () => {
 
     const finalOrder = await waitForStatus(server, created.id, 'PROCESSED');
     expect(finalOrder.failureReason).toBeNull();
+    const run = await dataSource
+      .getRepository(OrderProcessingRunEntity)
+      .findOneByOrFail({
+        orderId: created.id,
+        generation: 1,
+        processingRun: 1,
+      });
+    expect(run).toMatchObject({
+      source: 'CREATE',
+      eventType: 'order.created',
+      status: 'PROCESSED',
+      requestedBy: null,
+    });
+    expect(run.startedAt).toBeInstanceOf(Date);
+    expect(run.completedAt).toBeInstanceOf(Date);
+    const outbox = await dataSource
+      .getRepository(OutboxEventEntity)
+      .findOneByOrFail({ eventId: run.eventId });
+    expect(outbox.eventType).toBe(run.eventType);
     const stock = await dataSource
       .getRepository(ProductEntity)
       .findOneByOrFail({
@@ -86,10 +107,159 @@ describe('aceitação real MySQL + RabbitMQ', () => {
     const created = response.body as { id: number };
     const finalOrder = await waitForStatus(server, created.id, 'FAILED');
     expect(finalOrder.failureReason).toContain('Estoque insuficiente');
+    const run = await dataSource
+      .getRepository(OrderProcessingRunEntity)
+      .findOneByOrFail({
+        orderId: created.id,
+        generation: 1,
+        processingRun: 1,
+      });
+    expect(run).toMatchObject({
+      status: 'FAILED',
+      failureReason: finalOrder.failureReason,
+      eventType: 'order.created',
+    });
+    expect(run.completedAt).toBeInstanceOf(Date);
     const firstProduct = await dataSource
       .getRepository(ProductEntity)
       .findOneByOrFail({ name: 'rollback-first-item' });
     expect(firstProduct.stock).toBe(5);
+  }, 15000);
+
+  it('reprocessa pedido FAILED com geração nova e ignora evento antigo', async () => {
+    const response = await request(server)
+      .post('/orders')
+      .send({
+        customerName: 'Aceitação de reprocessamento',
+        items: [
+          { productName: 'acceptance-manual-reprocess', quantity: 6, price: 1 },
+        ],
+      })
+      .expect(201);
+    const created = response.body as { id: number };
+    const failed = await waitForStatus(server, created.id, 'FAILED');
+    expect(failed.failureReason).toContain('Estoque insuficiente');
+
+    const product = await dataSource
+      .getRepository(ProductEntity)
+      .findOneByOrFail({ name: 'acceptance-manual-reprocess' });
+    await dataSource
+      .getRepository(ProductEntity)
+      .update(product.id, { stock: 10 });
+
+    const reprocessResponse = await request(server)
+      .post(`/orders/${created.id}/reprocess`)
+      .expect(202);
+    expect(reprocessResponse.body).toMatchObject({
+      status: 'PENDING',
+      generation: 2,
+      processingRun: 2,
+    });
+    const processed = await waitForOrder(server, created.id, 'PROCESSED');
+    expect(processed.generation).toBe(2);
+    const runs = await dataSource
+      .getRepository(OrderProcessingRunEntity)
+      .findBy({ orderId: created.id });
+    expect(runs).toHaveLength(2);
+    expect(runs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          generation: 1,
+          processingRun: 1,
+          source: 'CREATE',
+          status: 'FAILED',
+        }),
+        expect.objectContaining({
+          generation: 2,
+          processingRun: 2,
+          source: 'MANUAL',
+          status: 'PROCESSED',
+          requestedBy: null,
+        }),
+      ]),
+    );
+
+    const reprocessEvent = await dataSource
+      .getRepository(OutboxEventEntity)
+      .findOneByOrFail({ eventType: 'order.reprocess.requested' });
+    expect(reprocessEvent.payload).toMatchObject({
+      eventType: 'order.reprocess.requested',
+      version: 1,
+      orderId: created.id,
+      generation: 2,
+      processingRun: 2,
+    });
+    const manualRun = runs.find((run) => run.generation === 2);
+    expect(manualRun?.eventId).toBe(reprocessEvent.eventId);
+    expect(manualRun?.eventType).toBe(reprocessEvent.eventType);
+
+    amqpChannel.sendToQueue(
+      'order.created',
+      Buffer.from(
+        JSON.stringify({
+          eventType: 'order.created',
+          version: 1,
+          orderId: created.id,
+          generation: 1,
+          processingRun: 1,
+        }),
+      ),
+      { persistent: true },
+    );
+    await amqpChannel.waitForConfirms();
+    await waitUntil(async () => {
+      const queue = await amqpChannel.checkQueue('order.created');
+      return queue.messageCount === 0;
+    });
+    await delay(250);
+    const finalProduct = await dataSource
+      .getRepository(ProductEntity)
+      .findOneByOrFail({ name: 'acceptance-manual-reprocess' });
+    expect(finalProduct.stock).toBe(4);
+  }, 20000);
+
+  it('serializa solicitações concorrentes de reprocessamento e grava um evento', async () => {
+    const id = await createOrderWithoutOutbox(
+      dataSource,
+      'acceptance-reprocess-race',
+      1,
+    );
+    await dataSource.getRepository(OrderEntity).update(id, {
+      status: 'FAILED',
+      failureReason: 'falha anterior',
+    });
+    await dataSource
+      .getRepository(OrderProcessingRunEntity)
+      .update(
+        { orderId: id, generation: 1, processingRun: 1 },
+        { status: 'FAILED', failureReason: 'falha anterior' },
+      );
+
+    const responses = await Promise.all([
+      request(server).post(`/orders/${id}/reprocess`),
+      request(server).post(`/orders/${id}/reprocess`),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([
+      202, 409,
+    ]);
+    const order = await dataSource
+      .getRepository(OrderEntity)
+      .findOneByOrFail({ id });
+    expect(order.status).toBe('PENDING');
+    expect(order.generation).toBe(2);
+    expect(order.processingRun).toBe(2);
+
+    const reprocessEvents = await dataSource
+      .getRepository(OutboxEventEntity)
+      .findBy({ eventType: 'order.reprocess.requested' });
+    expect(
+      reprocessEvents.filter((event) => Number(event.payload.orderId) === id),
+    ).toHaveLength(1);
+    const history = await dataSource
+      .getRepository(OrderProcessingRunEntity)
+      .findBy({ orderId: id });
+    expect(history).toHaveLength(2);
+    expect(history.filter((run) => run.generation === 2)).toHaveLength(1);
   }, 15000);
 
   it('serializa reservas concorrentes no MySQL sem permitir saldo negativo', async () => {
@@ -134,7 +304,15 @@ describe('aceitação real MySQL + RabbitMQ', () => {
       .expect(201);
     const created = response.body as { id: number };
     await waitForStatus(server, created.id, 'PROCESSED');
-    const body = Buffer.from(JSON.stringify({ orderId: created.id }));
+    const body = Buffer.from(
+      JSON.stringify({
+        eventType: 'order.created',
+        version: 1,
+        orderId: created.id,
+        generation: 1,
+        processingRun: 1,
+      }),
+    );
     amqpChannel.sendToQueue('order.created', body, { persistent: true });
     amqpChannel.sendToQueue('order.created', body, { persistent: true });
     await amqpChannel.waitForConfirms();
@@ -147,6 +325,40 @@ describe('aceitação real MySQL + RabbitMQ', () => {
       .getRepository(ProductEntity)
       .findOneByOrFail({ name: 'acceptance-redelivery' });
     expect(product.stock).toBe(3);
+    expect(
+      await dataSource
+        .getRepository(OrderProcessingRunEntity)
+        .countBy({ orderId: created.id }),
+    ).toBe(1);
+  }, 15000);
+
+  it('impõe unicidade por pedido, generation e processingRun no MySQL', async () => {
+    const response = await request(server)
+      .post('/orders')
+      .send({
+        customerName: 'Aceitação de constraint',
+        items: [
+          { productName: 'acceptance-run-unique', quantity: 1, price: 1 },
+        ],
+      })
+      .expect(201);
+    const created = response.body as { id: number };
+    const runs = dataSource.getRepository(OrderProcessingRunEntity);
+    await expect(
+      runs.insert({
+        orderId: created.id,
+        generation: 1,
+        processingRun: 1,
+        source: 'CREATE',
+        eventId: null,
+        eventType: 'order.created',
+        status: 'PENDING',
+        failureReason: null,
+        startedAt: null,
+        completedAt: null,
+        requestedBy: null,
+      }),
+    ).rejects.toThrow();
   }, 15000);
 
   it('reprocessa erro MySQL transitório por fila TTL real e conclui o pedido', async () => {
@@ -261,6 +473,19 @@ async function createOrderWithoutOutbox(
   item.order = entity;
   entity.items = [item];
   const saved = await dataSource.getRepository(OrderEntity).save(entity);
+  await dataSource.getRepository(OrderProcessingRunEntity).insert({
+    orderId: saved.id,
+    generation: saved.generation,
+    processingRun: saved.processingRun,
+    source: 'CREATE',
+    eventId: null,
+    eventType: 'order.created',
+    status: 'PENDING',
+    failureReason: null,
+    startedAt: null,
+    completedAt: null,
+    requestedBy: null,
+  });
   return saved.id;
 }
 
@@ -272,17 +497,33 @@ async function waitForStatus(
   server: Server,
   id: number,
   expectedStatus: string,
-): Promise<{ status: string; failureReason: string | null }> {
-  let result: { status: string; failureReason: string | null } | undefined;
+): Promise<{
+  status: string;
+  failureReason: string | null;
+  generation?: number;
+}> {
+  let result:
+    | { status: string; failureReason: string | null; generation?: number }
+    | undefined;
   await waitUntil(async () => {
     const response = await request(server).get(`/orders/${id}`).expect(200);
     result = response.body as {
       status: string;
       failureReason: string | null;
+      generation?: number;
     };
     return result.status === expectedStatus;
   });
   return result as { status: string; failureReason: string | null };
+}
+
+async function waitForOrder(
+  server: Server,
+  id: number,
+  expectedStatus: string,
+): Promise<{ status: string; generation: number }> {
+  const result = await waitForStatus(server, id, expectedStatus);
+  return result as { status: string; generation: number };
 }
 
 async function waitUntil(

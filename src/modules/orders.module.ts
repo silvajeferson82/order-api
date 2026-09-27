@@ -4,6 +4,7 @@ import { OrderEntity } from '../infrastructure/database/entities/order.entity';
 import { OrderItemEntity } from '../infrastructure/database/entities/order-item.entity';
 import { ProductEntity } from '../infrastructure/database/entities/product.entity';
 import { OutboxEventEntity } from '../infrastructure/database/entities/outbox-event.entity';
+import { OrderProcessingRunEntity } from '../infrastructure/database/entities/order-processing-run.entity';
 import { OrderQueueModule } from '../queue/order-queue.module';
 import { OrderConsumerService } from '../queue/order-consumer.service';
 import { ORDER_REPOSITORY } from '../domain/orders/order-repository';
@@ -23,6 +24,7 @@ import { AuthModule } from '../auth/auth.module';
       OrderItemEntity,
       ProductEntity,
       OutboxEventEntity,
+      OrderProcessingRunEntity,
     ]),
     OrderQueueModule,
   ],

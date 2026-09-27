@@ -1,13 +1,19 @@
 import {
   Body,
+  ConflictException,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
+  NotFoundException,
   Param,
   ParseIntPipe,
   Post,
   Query,
+  Req,
   UseGuards,
 } from '@nestjs/common';
+import type { Request } from 'express';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -27,6 +33,10 @@ import {
   OrderResponseDto,
 } from './dtos/order-response.dto';
 import { OrderPaginationDto } from './dtos/order-pagination.dto';
+import {
+  OrderNotFoundError,
+  OrderNotReprocessableError,
+} from '../../domain/orders/order-errors';
 
 @ApiExtraModels(OrderResponseDto, OrderListResponseDto)
 @ApiTags('Pedidos')
@@ -41,7 +51,7 @@ export class OrdersController {
   @ApiOperation({
     summary: 'Cria um pedido',
     description:
-      'Persiste o pedido com status PENDING e publica o evento order.created.',
+      'Persiste o pedido como PENDING e grava order.created na outbox transacional para publicação assíncrona.',
   })
   @ApiBody({
     type: CreateOrderDto,
@@ -70,6 +80,8 @@ export class OrdersController {
             customerName: 'Alice Silva',
             total: 240,
             status: 'PENDING',
+            generation: 1,
+            processingRun: 1,
             failureReason: null,
             items: [
               { id: 1, productName: 'Keyboard', quantity: 2, price: 100 },
@@ -85,8 +97,52 @@ export class OrdersController {
   @ApiResponse({ status: 400, description: 'Dados de entrada inválidos.' })
   @ApiResponse({ status: 401, description: 'Token ausente ou inválido.' })
   @ApiResponse({ status: 403, description: 'Papel order-admin necessário.' })
-  async create(@Body() dto: CreateOrderDto): Promise<OrderResponseDto> {
-    return this.toResponse(await this.ordersService.create(dto));
+  async create(
+    @Body() dto: CreateOrderDto,
+    @Req() request: Request & { user?: { sub?: unknown } },
+  ): Promise<OrderResponseDto> {
+    return this.toResponse(
+      await this.ordersService.create(dto, requesterSub(request)),
+    );
+  }
+
+  @Post(':id/reprocess')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @Roles('order-admin')
+  @ApiOperation({
+    summary: 'Reprocessa um pedido FAILED',
+    description:
+      'Cria uma nova geração de processamento e grava o evento na outbox na mesma transação.',
+  })
+  @ApiParam({ name: 'id', example: 1, type: Number })
+  @ApiResponse({
+    status: 202,
+    description: 'Nova tentativa aceita; processamento assíncrono iniciado.',
+    type: OrderResponseDto,
+  })
+  @ApiResponse({ status: 400, description: 'Identificador inválido.' })
+  @ApiResponse({ status: 404, description: 'Pedido não encontrado.' })
+  @ApiResponse({ status: 409, description: 'Pedido não está FAILED.' })
+  @ApiResponse({ status: 401, description: 'Token ausente ou inválido.' })
+  @ApiResponse({ status: 403, description: 'Papel order-admin necessário.' })
+  async reprocess(
+    @Param('id', ParseIntPipe) id: number,
+    @Req() request: Request & { user?: { sub?: unknown } },
+  ): Promise<OrderResponseDto> {
+    try {
+      return this.toResponse(
+        await this.ordersService.reprocess(id, requesterSub(request)),
+      );
+    } catch (error) {
+      if (error instanceof OrderNotFoundError) {
+        throw new NotFoundException(error.message);
+      }
+
+      if (error instanceof OrderNotReprocessableError) {
+        throw new ConflictException(error.message);
+      }
+      throw error;
+    }
   }
 
   @Get(':id')
@@ -104,6 +160,8 @@ export class OrdersController {
             customerName: 'Alice Silva',
             total: 240,
             status: 'PROCESSED',
+            generation: 1,
+            processingRun: 1,
             failureReason: null,
             items: [
               { id: 1, productName: 'Keyboard', quantity: 2, price: 100 },
@@ -141,6 +199,8 @@ export class OrdersController {
                 customerName: 'Alice Silva',
                 total: 240,
                 status: 'PENDING',
+                generation: 1,
+                processingRun: 1,
                 failureReason: null,
                 items: [
                   { id: 1, productName: 'Keyboard', quantity: 2, price: 100 },
@@ -184,4 +244,12 @@ export class OrdersController {
       })),
     };
   }
+}
+
+function requesterSub(
+  request: Request & { user?: { sub?: unknown } },
+): string | null {
+  return typeof request.user?.sub === 'string' && request.user.sub.length > 0
+    ? request.user.sub
+    : null;
 }

@@ -12,6 +12,8 @@ export type Order = {
   customerName: string;
   total: number;
   status: OrderStatus;
+  generation: number;
+  processingRun: number;
   failureReason: string | null;
   items: OrderItem[];
   createdAt: Date;
@@ -22,6 +24,8 @@ export type OrderDraft = {
   customerName: string;
   total: number;
   status: OrderStatus;
+  generation: number;
+  processingRun: number;
   items: Array<{ productName: string; quantity: number; price: number }>;
 };
 

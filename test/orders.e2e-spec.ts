@@ -5,6 +5,10 @@ import { createServer, Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
+import { DataSource } from 'typeorm';
+import { OrderEntity } from '../src/infrastructure/database/entities/order.entity';
+import { OutboxEventEntity } from '../src/infrastructure/database/entities/outbox-event.entity';
+import { OrderProcessingRunEntity } from '../src/infrastructure/database/entities/order-processing-run.entity';
 
 type TestApplication = Omit<INestApplication, 'getHttpServer'> & {
   getHttpServer(): Server;
@@ -216,6 +220,108 @@ describe('Orders API auth (e2e)', () => {
       .expect(201);
     expect(response.body).toHaveProperty('id');
     expect((response.body as { status: string }).status).toBe('PENDING');
+    const orderId = (response.body as { id: number }).id;
+    const run = await app
+      .get(DataSource)
+      .getRepository(OrderProcessingRunEntity)
+      .findOneByOrFail({ orderId, generation: 1, processingRun: 1 });
+    const createEvent = await app
+      .get(DataSource)
+      .getRepository(OutboxEventEntity)
+      .findOneByOrFail({ eventId: run.eventId });
+    expect(run).toMatchObject({
+      source: 'CREATE',
+      eventType: 'order.created',
+      status: 'PENDING',
+      requestedBy: 'test-user',
+    });
+    expect(createEvent.eventType).toBe(run.eventType);
+  });
+
+  it('reprocessa somente pedido FAILED, com papel admin e nova geração/outbox', async () => {
+    const created = await request(app.getHttpServer())
+      .post('/orders')
+      .set('Authorization', `Bearer ${token(['order-admin'])}`)
+      .send({
+        customerName: 'Pedido reprocessável',
+        items: [{ productName: 'Reprocessável', quantity: 1, price: 2 }],
+      })
+      .expect(201);
+    const id = (created.body as { id: number }).id;
+    const dataSource = app.get(DataSource);
+    await dataSource.getRepository(OrderEntity).update(id, {
+      status: 'FAILED',
+      failureReason: 'estoque insuficiente',
+    });
+    await dataSource
+      .getRepository(OrderProcessingRunEntity)
+      .update(
+        { orderId: id, generation: 1, processingRun: 1 },
+        { status: 'FAILED', failureReason: 'estoque insuficiente' },
+      );
+
+    await request(app.getHttpServer())
+      .post(`/orders/${id}/reprocess`)
+      .set('Authorization', `Bearer ${token(['order-user'])}`)
+      .expect(403);
+
+    const response = await request(app.getHttpServer())
+      .post(`/orders/${id}/reprocess`)
+      .set('Authorization', `Bearer ${token(['order-admin'])}`)
+      .expect(202);
+    expect(response.body).toMatchObject({
+      id,
+      status: 'PENDING',
+      generation: 2,
+      processingRun: 2,
+      failureReason: null,
+    });
+
+    const event = await dataSource.getRepository(OutboxEventEntity).findOneBy({
+      eventType: 'order.reprocess.requested',
+    });
+    expect(event?.payload).toMatchObject({
+      eventType: 'order.reprocess.requested',
+      version: 1,
+      orderId: id,
+      generation: 2,
+      processingRun: 2,
+    });
+    const manualRun = await dataSource
+      .getRepository(OrderProcessingRunEntity)
+      .findOneByOrFail({ orderId: id, generation: 2, processingRun: 2 });
+    expect(manualRun).toMatchObject({
+      source: 'MANUAL',
+      eventId: event?.eventId,
+      eventType: 'order.reprocess.requested',
+      status: 'PENDING',
+      requestedBy: 'test-user',
+    });
+  });
+
+  it('mapeia pedido ausente, estado inválido e identificador malformado', async () => {
+    const authorization = `Bearer ${token(['order-admin'])}`;
+    await request(app.getHttpServer())
+      .post('/orders/999999/reprocess')
+      .set('Authorization', authorization)
+      .expect(404);
+    await request(app.getHttpServer())
+      .post('/orders/invalid/reprocess')
+      .set('Authorization', authorization)
+      .expect(400);
+
+    const created = await request(app.getHttpServer())
+      .post('/orders')
+      .set('Authorization', authorization)
+      .send({
+        customerName: 'Ainda pendente',
+        items: [{ productName: 'Pending', quantity: 1, price: 1 }],
+      })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`/orders/${(created.body as { id: number }).id}/reprocess`)
+      .set('Authorization', authorization)
+      .expect(409);
   });
 
   it('busca e aceita kid novo após rotação JWKS, sem fallback aberto', async () => {

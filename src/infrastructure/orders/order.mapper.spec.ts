@@ -9,6 +9,8 @@ describe('order mapper', () => {
     customerName: 'Alice',
     total: 25,
     status: 'PENDING',
+    generation: 1,
+    processingRun: 1,
     failureReason: null,
     items: [{ id: 7, productName: 'Keyboard', quantity: 1, price: 25 }],
     createdAt: new Date('2026-09-25T00:00:00.000Z'),

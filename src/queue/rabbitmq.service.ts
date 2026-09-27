@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { ConfirmChannel, ChannelModel } from 'amqplib';
-import { OrderCreatedEvent } from '../application/ports/order-event-publisher.port';
+import type { DomainEvent } from '../domain/orders/events/domain-event';
 
 @Injectable()
 export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
@@ -116,7 +116,7 @@ export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
     return this.channel;
   }
 
-  async publishOrderCreated(event: OrderCreatedEvent): Promise<void> {
+  async publishDomainEvent(event: DomainEvent): Promise<void> {
     if (!this.channel) {
       throw new Error('RabbitMQ indisponível para publicação do evento');
     }

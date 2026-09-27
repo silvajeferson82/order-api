@@ -16,6 +16,8 @@ import {
   OrderNotReprocessableError,
 } from '../../domain/orders/order-errors';
 import type { DomainEvent } from '../../domain/orders/events/domain-event';
+import { requestContext } from '../../observability/request-context';
+import { context, propagation } from '@opentelemetry/api';
 
 export class TypeOrmOrderRepository implements OrderRepository {
   constructor(
@@ -98,10 +100,35 @@ export class TypeOrmOrderRepository implements OrderRepository {
     event: DomainEvent,
   ): Promise<string> {
     const eventId = randomUUID();
+    const currentContext = requestContext.current();
+    if (currentContext) {
+      currentContext.eventId = eventId;
+      currentContext.eventType = event.eventType;
+    }
+    const requestId = event.requestId ?? requestContext.current()?.requestId;
+    const traceContext: Record<string, string> = {};
+    propagation.inject(context.active(), traceContext);
+    const traceparent =
+      typeof traceContext.traceparent === 'string'
+        ? traceContext.traceparent
+        : undefined;
+    const tracestate =
+      typeof traceContext.tracestate === 'string'
+        ? traceContext.tracestate
+        : undefined;
     await manager.getRepository(OutboxEventEntity).insert({
       eventId,
       eventType: event.eventType,
-      payload: { ...event },
+      requestId: requestId ?? null,
+      traceparent: traceparent ?? null,
+      tracestate: tracestate ?? null,
+      payload: {
+        ...event,
+        eventId,
+        ...(requestId ? { requestId } : {}),
+        ...(traceparent ? { traceparent } : {}),
+        ...(tracestate ? { tracestate } : {}),
+      },
     });
     return eventId;
   }

@@ -99,6 +99,19 @@ describe('validateConfiguration', () => {
     ).toThrow('AUTH_ENABLED=false não é permitido em produção');
   });
 
+  it('exige token dedicado de métricas em produção', () => {
+    expect(() =>
+      validateConfiguration({
+        NODE_ENV: 'production',
+        AUTH_ENABLED: true,
+        KEYCLOAK_ISSUER: 'https://id.example.test/realms/orders',
+        KEYCLOAK_AUDIENCE: 'order-api',
+        KEYCLOAK_JWKS_URI:
+          'https://id.example.test/realms/orders/protocol/openid-connect/certs',
+      }),
+    ).toThrow('METRICS_TOKEN com pelo menos 32 caracteres');
+  });
+
   it('não permite desabilitar autenticação em ambiente não local', () => {
     expect(() =>
       validateConfiguration({
@@ -120,6 +133,7 @@ describe('validateConfiguration', () => {
         KEYCLOAK_JWKS_URI:
           'https://id.example.test/realms/orders/protocol/openid-connect/certs',
         JWKS_TIMEOUT_MS: '5000',
+        METRICS_TOKEN: 'local-test-token-with-at-least-32-characters',
       }),
     ).toMatchObject({
       AUTH_ENABLED: true,

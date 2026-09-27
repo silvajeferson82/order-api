@@ -9,6 +9,8 @@ import { DataSource } from 'typeorm';
 import { OrderEntity } from '../src/infrastructure/database/entities/order.entity';
 import { OutboxEventEntity } from '../src/infrastructure/database/entities/outbox-event.entity';
 import { OrderProcessingRunEntity } from '../src/infrastructure/database/entities/order-processing-run.entity';
+import { MetricsService } from '../src/observability/metrics.service';
+import { createHttpObservabilityMiddleware } from '../src/observability/http-observability.middleware';
 
 type TestApplication = Omit<INestApplication, 'getHttpServer'> & {
   getHttpServer(): Server;
@@ -66,6 +68,7 @@ describe('Orders API auth (e2e)', () => {
     }).compile();
 
     app = moduleRef.createNestApplication();
+    app.use(createHttpObservabilityMiddleware(app.get(MetricsService)));
     await app.init();
   });
 
@@ -89,6 +92,26 @@ describe('Orders API auth (e2e)', () => {
         `Bearer ${token(['order-user'], { expiresIn: -1 })}`,
       )
       .expect(401);
+  });
+
+  it('expõe somente /metrics publicamente e não cria rota de health', async () => {
+    const metrics = await request(app.getHttpServer())
+      .get('/metrics')
+      .set('X-Request-Id', '123e4567-e89b-12d3-a456-426614174000')
+      .expect(200);
+    expect(metrics.headers['content-type']).toContain('text/plain');
+    expect(metrics.headers['x-request-id']).toBe(
+      '123e4567-e89b-12d3-a456-426614174000',
+    );
+    expect(metrics.text).toContain('http_requests_total');
+    const generated = await request(app.getHttpServer())
+      .get('/metrics')
+      .set('X-Request-Id', 'x'.repeat(129))
+      .expect(200);
+    expect(generated.headers['x-request-id']).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    await request(app.getHttpServer()).get('/health').expect(404);
   });
 
   it('responde 401 para assinatura, issuer, audience e nbf inválidos', async () => {

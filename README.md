@@ -181,14 +181,197 @@ segundos. A publicação no retry também usa publisher confirm antes de confirm
 a mensagem original. Depois das três tentativas adicionais, o pedido é marcado
 `FAILED` e a mensagem vai para a DLQ.
 
+## Observabilidade e operação
+
+Os logs da aplicação são JSON em stdout/stderr. O middleware aceita
+`X-Request-Id` apenas quando é um UUID válido; outros valores (inclusive
+strings longas, token-like ou IDs sem formato UUID) são substituídos por UUID.
+A resposta sempre
+retorna `X-Request-Id`. O identificador é propagado por AsyncLocalStorage,
+gravado na outbox/evento quando o pedido nasce via HTTP e enviado nos headers
+RabbitMQ. Eventos anteriores à mudança continuam válidos e podem não ter
+`requestId`, `traceparent` ou `eventId` no payload.
+
+Os logs dos marcos `order.create.accepted`, `order.reprocess.accepted`,
+`outbox.event.published`/`outbox.event.publish_failed` e
+`consumer.attempt.started`/`succeeded`/`failed`/
+`retry_scheduled`/`message.stale` carregam os IDs aplicáveis
+(`requestId`, `eventId`, `orderId`, `generation`, `processingRun`,
+`eventType`). O sistema não registra corpo de pedido, itens, nomes de cliente,
+JWT, credenciais nem conteúdo integral da mensagem. A `failureReason` continua
+persistida para diagnóstico funcional; não a copie para canais de log/ticket
+sem avaliar se contém informação sensível.
+
+### Subir o profile local de observabilidade
+
+O profile não é iniciado no `docker compose up` padrão. Para ativar os
+exporters OTLP e os serviços de observabilidade:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+  docker compose --profile observability up --build -d
+docker compose --profile observability ps
+docker compose --profile observability logs -f api prometheus loki alloy otel-collector tempo
+```
+
+Endpoints publicados apenas em loopback:
+
+| Serviço | URL local | Uso |
+| --- | --- | --- |
+| Prometheus | http://localhost:9090 | métricas, regras e alertas avaliados |
+| Grafana | http://localhost:3001 | dashboard `Order API / Order API - Operações` e Explore |
+| Loki | http://localhost:3101 | logs JSON do container API, retenção de 72 horas |
+| RabbitMQ Management | http://localhost:15672 | filas e consumers |
+| API `/metrics` | http://localhost:3000/metrics | scrape Prometheus; não é rota health |
+
+No primeiro acesso local ao Grafana, troque a senha de bootstrap imediatamente
+e use essa instância somente para desenvolvimento local. As credenciais de
+MySQL e RabbitMQ são as definidas localmente pelas variáveis `MYSQL_*` e
+`RABBITMQ_*` no `.env`; não copie valores de exemplo para produção. As portas
+do MySQL, AMQP, API, Management, Prometheus e Grafana estão limitadas a
+`127.0.0.1` pelo Compose. O endpoint Prometheus do RabbitMQ
+(`15692`) e o OTLP (`4318`) não são publicados no host, só ficam acessíveis na
+rede Compose. Tempo mantém traces por até 72 horas; Prometheus, Grafana, Tempo e Loki usam
+volumes persistentes e podem conter dados operacionais. Loki também persiste
+logs por até 72 horas.
+
+O Alloy usa a API Docker para descobrir exclusivamente containers com labels
+Compose do projeto atual e serviço `api`; os IDs ficam como structured
+metadata no Loki, não como labels indexadas. O socket Docker concede poder
+elevado, efetivamente equivalente a controle do daemon local; o mount `:ro`
+não limita as operações da API. Portanto, este profile é apenas para uma
+máquina de desenvolvimento com daemon isolado, não para ambiente compartilhado
+ou produção. Se não aceitar esse risco, não ative Alloy/profile; use os logs
+diretamente com `docker compose logs`.
+
+Em ambiente `production`, `METRICS_TOKEN` é obrigatório e deve ter pelo menos
+32 caracteres aleatórios. O scrape da API deve enviar esse segredo em
+`X-Metrics-Token` e estar restrito por rede/firewall; o token não deve ser
+colocado em arquivos versionados nem em argumentos de linha de comando
+persistentes. O Prometheus do profile local não configura autenticação de
+scrape: não defina `METRICS_TOKEN` no ambiente local se quiser usá-lo sem
+ajustar também uma credencial de scrape protegida. `/metrics` não tem JWT de
+propósito para permitir scrape; com token configurado, a rota exige o token.
+Não existe rota HTTP `/health`.
+
+Os spans HTTP seguem `traceparent`/`tracestate`; os spans
+`outbox.publish` e `order.process` preservam a relação com a requisição e
+atravessam os headers AMQP, inclusive retries. No Grafana, abra **Explore**:
+use Loki para buscar logs JSON e Tempo para filtrar por `request.id`.
+Métricas não usam IDs individuais como labels. Foram adicionadas métricas HTTP,
+resultados/duração de processamento, outbox pendente/idade/tentativas e
+resultados de consumer/retry. O plugin `rabbitmq_prometheus` fornece métricas
+da fila, incluindo ready, unacked e consumers. As regras ficam em
+`observability/prometheus/alerts.yml` e podem ser consultadas em
+`http://localhost:9090/alerts`: backlog da outbox/fila principal, outbox com
+mais de 10 minutos, mensagens na DLQ, proporção elevada de falhas e scrape
+indisponível. As regras são avaliadas localmente no Prometheus; não há
+Alertmanager nem integração de notificação configurada.
+
+### Runbook: pedido `X` continua `PENDING` há 10 minutos
+
+1. Confirme o ID do pedido e o horário/ambiente. Não use o corpo completo do
+   pedido para buscar diagnóstico.
+2. Faça as consultas abaixo em uma sessão MySQL somente leitura. Os campos de
+   saída não incluem nome do cliente, itens nem payload completo:
+
+```sql
+START TRANSACTION READ ONLY;
+
+SELECT id, status, generation, processingRun, failureReason, createdAt, updatedAt,
+       TIMESTAMPDIFF(MINUTE, createdAt, CURRENT_TIMESTAMP) AS ageMinutes
+FROM orders
+WHERE id = X;
+
+SELECT orderId, generation, processingRun, source, eventId, eventType, status,
+       failureReason, startedAt, completedAt, createdAt
+FROM order_processing_runs
+WHERE orderId = X
+ORDER BY generation, processingRun;
+
+SELECT eventId, eventType, requestId, attempts, publishedAt, createdAt
+FROM outbox_events
+WHERE eventType IN ('order.created', 'order.reprocess.requested')
+  AND JSON_EXTRACT(payload, '$.orderId') = X
+ORDER BY id DESC;
+
+COMMIT;
+```
+
+   Substitua `X` por um inteiro validado. A consulta da outbox usa o JSON do
+   evento apenas para filtrar o ID; não selecione nem compartilhe o payload.
+3. Interprete os tempos/estados junto com a fila:
+   - `orders.status=PENDING`, execução `PENDING` com `startedAt IS NULL`:
+     ainda não há início válido do consumer. Se a outbox não tem linha ou
+     `publishedAt IS NULL`, investigue dispatcher, erro de publicação e
+     conectividade do broker.
+   - `publishedAt` preenchido comprova que o dispatcher recebeu publisher
+     confirm e atualizou o MySQL; **não** comprova que o consumer processou a
+     mensagem. Compare fila pronta, consumers e retry.
+   - `outbox_events.attempts` conta falhas de publicação registradas no banco,
+     e não entregas RabbitMQ nem confirmações bem-sucedidas. A métrica
+     `order_outbox_publication_attempts_total` contabiliza as tentativas do
+     dispatcher.
+   - `startedAt` preenchido indica que uma entrega válida iniciou aquela
+     execução. Retries não reiniciam esse timestamp. `completedAt` preenchido
+     e status terminal indicam resultado persistido; `failureReason` explica
+     uma execução `FAILED`.
+   - Uma geração/run anterior pode estar obsoleta após reprocessamento. Use
+     sempre o par atual `generation`/`processingRun`; o consumer reconhece e
+     confirma entregas antigas sem processá-las.
+4. Abra http://localhost:15672 com as credenciais locais e selecione o vhost
+   `/`, depois **Queues and Streams**. Examine `order.created`,
+   `order.created.retry.1`, `.retry.2`, `.retry.3` e `order.created.dlq`:
+   `Ready` é aguardando entrega; `Unacked` é entregue e ainda não confirmada;
+   `Consumers` deve mostrar o worker conectado. Crescimento de `Ready` com
+   consumers zero aponta para worker/conexão; `Unacked` parado pode indicar
+   processamento suspenso ou demorado; retry crescente indica falha transitória
+   e DLQ com conteúdo requer investigação da razão permanente/esgotamento.
+5. Busque os logs JSON locais pelo `requestId` retornado no header HTTP (ou
+   `eventId`/`orderId`/`generation`):
+
+```bash
+docker compose logs --since 30m --no-color api | grep -F '"requestId":"<uuid>"'
+docker compose logs --since 30m --no-color api | grep -F '"eventId":"<uuid>"'
+```
+
+   No Grafana **Explore**, escolha Loki e use
+   `{job="order-api"} | requestId="<uuid>"` (ou filtre `eventId`/`orderId`).
+   Os IDs são structured metadata e não labels indexadas. Para traces, selecione
+   Tempo e filtre o atributo `request.id` para abrir o trace HTTP e seus spans
+   `outbox.publish` e `order.process`. Sem request ID em evento antigo,
+   correlacione por `eventId`/IDs de execução e timestamps; não presuma que
+   evento legado possui trace.
+6. Consulte as séries do dashboard/Prometheus:
+   `order_outbox_pending`,
+   `order_outbox_oldest_pending_age_seconds`,
+   `order_outbox_publication_attempts_total`,
+   `order_processing_results_total`,
+   `order_consumer_results_total`,
+   `rabbitmq_detailed_queue_messages_ready`,
+   `rabbitmq_detailed_queue_messages_unacked` e
+   `rabbitmq_detailed_queue_consumers` (famílias detalhadas do plugin 3.13).
+   Use as regras ativas em `/alerts` como sinais,
+   não como prova isolada da causa.
+7. A inspeção do Management deve ser somente leitura. Não use **Get messages**,
+   ack, requeue, purge ou alteração de bindings como tentativa de diagnóstico:
+   isso pode consumir uma mensagem, alterar sua ordem, duplicar processamento
+   ou apagar evidência. Não faça `nack` manual nem requeue silencioso. Não
+   apague/republique a linha da outbox. Para pedido já persistido como
+   `FAILED`, o caminho suportado é `POST /orders/:id/reprocess` com papel
+   `order-admin`; para fila/DLQ, registre evidência e valide um procedimento
+   operacional revisado antes de qualquer intervenção.
+
 ### Limitações operacionais conhecidas
 
 - A outbox não tem mecanismo distribuído de claim/lease: várias réplicas da
   API podem publicar o mesmo evento pendente. O fluxo tolera redelivery, mas
   isso não substitui uma estratégia de coordenação para escalar dispatchers.
-- Há logs de erro, mas não estão configurados métricas, alertas, tracing,
-  painel operacional ou procedimento automatizado de inspeção da DLQ. O novo
-  endpoint reprocessa somente pedidos cuja falha já foi persistida no banco;
+- O profile local avalia regras Prometheus, mas não envia notificações; métricas
+  RabbitMQ dependem de `rabbitmq_prometheus` e os spans são exportados apenas
+  quando o endpoint OTLP está configurado. Não há instrumentação de consultas
+  SQL/TypeORM. O novo endpoint reprocessa somente
+  pedidos cuja falha já foi persistida no banco;
   ele não consome nem altera diretamente mensagens da DLQ.
 - Os atrasos de retry são fixos e o dispatch da outbox volta a tentar no ciclo
   seguinte; não há política operacional configurável nem retenção/limpeza da

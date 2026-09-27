@@ -28,6 +28,12 @@ export class OrderResponseDto {
   @ApiProperty({ enum: ['PENDING', 'PROCESSED', 'FAILED'], example: 'PENDING' })
   status: OrderStatus;
 
+  @ApiProperty({ example: 1 })
+  generation: number;
+
+  @ApiProperty({ example: 1 })
+  processingRun: number;
+
   @ApiProperty({ nullable: true, example: null })
   failureReason: string | null;
 

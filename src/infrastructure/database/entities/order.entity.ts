@@ -23,6 +23,12 @@ export class OrderEntity {
   @Column({ type: 'varchar', length: 20, default: 'PENDING' })
   status: OrderStatus;
 
+  @Column({ type: 'int', default: 1 })
+  generation: number;
+
+  @Column({ type: 'int', default: 1 })
+  processingRun: number;
+
   @Column({ type: 'text', nullable: true })
   failureReason: string | null;
 

@@ -19,6 +19,8 @@ export function toOrderEntity(order: OrderSaveInput): OrderEntity {
   entity.customerName = order.customerName;
   entity.total = Number(order.total);
   entity.status = order.status;
+  entity.generation = order.generation;
+  entity.processingRun = order.processingRun;
   entity.items = order.items.map((item) => {
     const itemEntity = new OrderItemEntity();
     if ('id' in item) itemEntity.id = item.id;
@@ -37,6 +39,8 @@ export function toOrder(entity: OrderEntity): Order {
     customerName: entity.customerName,
     total: Number(entity.total),
     status: entity.status,
+    generation: entity.generation,
+    processingRun: entity.processingRun,
     failureReason: entity.failureReason ?? null,
     items: (entity.items ?? []).map((item) => ({
       id: item.id,
@@ -54,6 +58,8 @@ export function toOrderDraft(draft: OrderDraft): OrderDraft {
     customerName: draft.customerName,
     total: Number(draft.total),
     status: draft.status,
+    generation: draft.generation,
+    processingRun: draft.processingRun,
     items: draft.items.map((item) => ({
       productName: item.productName,
       quantity: item.quantity,

@@ -14,6 +14,8 @@ describe('OrdersService', () => {
     customerName: 'Alice Silva',
     total: 240,
     status: 'PENDING',
+    generation: 1,
+    processingRun: 1,
     failureReason: null,
     items: [
       { id: 1, productName: 'Keyboard', quantity: 2, price: 100 },
@@ -27,9 +29,13 @@ describe('OrdersService', () => {
     orderRepository = {
       create: jest.fn((draft) => draft),
       save: jest.fn().mockResolvedValue(savedOrder),
+      createWithEvent: jest.fn().mockResolvedValue(savedOrder),
+      reprocessFailed: jest.fn(),
       findOne: jest.fn(),
       findAll: jest.fn(),
       reserveAndProcess: jest.fn(),
+      startProcessingRun: jest.fn(),
+      updateStatusForGeneration: jest.fn(),
     };
     productRepository = {
       findByName: jest.fn().mockResolvedValue({
@@ -68,12 +74,37 @@ describe('OrdersService', () => {
       customerName: 'Alice Silva',
       total: 240,
       status: 'PENDING',
+      generation: 1,
+      processingRun: 1,
       items: [
         { productName: 'Keyboard', quantity: 2, price: 100 },
         { productName: 'Mouse', quantity: 1, price: 40 },
       ],
     });
+    expect(orderRepository.createWithEvent.mock.calls[0]).toEqual([
+      expect.anything(),
+      expect.any(Function),
+      undefined,
+    ]);
     expect(result.status).toBe('PENDING');
+  });
+
+  it('solicita reprocessamento pelo repositório transacional', async () => {
+    orderRepository.reprocessFailed.mockResolvedValue({
+      ...savedOrder,
+      status: 'PENDING',
+      generation: 2,
+      processingRun: 2,
+    });
+
+    const result = await service.reprocess(1);
+
+    expect(result.generation).toBe(2);
+    expect(orderRepository.reprocessFailed.mock.calls[0]).toEqual([
+      1,
+      expect.any(Function),
+      undefined,
+    ]);
   });
 
   it('rejeita paginação fora dos limites', async () => {

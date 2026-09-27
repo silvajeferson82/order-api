@@ -24,7 +24,7 @@ describe('OutboxDispatcherService', () => {
     Pick<Repository<OutboxEventEntity>, 'find' | 'update' | 'increment'>
   >;
   let publisher: jest.Mocked<
-    Pick<OrderQueuePublisher, 'getChannel' | 'publishOrderCreated'>
+    Pick<OrderQueuePublisher, 'getChannel' | 'publishDomainEvent'>
   >;
   let dispatcher: OutboxDispatcherService;
 
@@ -36,7 +36,7 @@ describe('OutboxDispatcherService', () => {
     };
     publisher = {
       getChannel: jest.fn().mockReturnValue({}),
-      publishOrderCreated: jest.fn().mockResolvedValue(undefined),
+      publishDomainEvent: jest.fn().mockResolvedValue(undefined),
     };
     dispatcher = new OutboxDispatcherService(
       outbox as unknown as Repository<OutboxEventEntity>,
@@ -47,15 +47,47 @@ describe('OutboxDispatcherService', () => {
   it('só marca o evento como publicado após publisher confirm', async () => {
     await dispatcher.dispatchPending();
 
-    expect(publisher.publishOrderCreated).toHaveBeenCalledWith({
-      orderId: 7,
-    });
+    expect(publisher.publishDomainEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'order.created',
+        version: 1,
+        orderId: 7,
+        generation: 1,
+        processingRun: 1,
+      }),
+    );
     expect(outbox.update).toHaveBeenCalledTimes(1);
     expect(outbox.increment).not.toHaveBeenCalled();
   });
 
+  it('publica evento de reprocessamento versionado pela mesma outbox', async () => {
+    outbox.find.mockResolvedValue([
+      {
+        ...event,
+        eventType: 'order.reprocess.requested',
+        payload: {
+          eventType: 'order.reprocess.requested',
+          version: 1,
+          orderId: 7,
+          generation: 2,
+          processingRun: 2,
+        },
+      },
+    ]);
+
+    await dispatcher.dispatchPending();
+
+    expect(publisher.publishDomainEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'order.reprocess.requested',
+        version: 1,
+        generation: 2,
+      }),
+    );
+  });
+
   it('preserva evento pendente e registra tentativa se publicação falhar', async () => {
-    publisher.publishOrderCreated.mockRejectedValue(
+    publisher.publishDomainEvent.mockRejectedValue(
       new Error('broker indisponível'),
     );
     await dispatcher.dispatchPending();

@@ -1,446 +1,332 @@
 # Order API
 
-API de pedidos em NestJS, com MySQL, RabbitMQ e processamento assíncrono.
+API de pedidos construída com NestJS. Ela grava pedidos no MySQL, publica eventos pelo RabbitMQ e processa reservas de estoque de forma assíncrona. O Keycloak pode autenticar e autorizar chamadas, e um profile opcional reúne ferramentas locais de logs, métricas e traces.
 
-## Pré-requisitos
+> **Importante:** o Compose padrão é voltado somente para desenvolvimento local. Ele desativa autenticação explicitamente e publica serviços em `127.0.0.1`; não exponha essa configuração como ambiente protegido.
 
-- Docker Engine 24+ e Docker Compose v2 (`docker compose`)
-- Para execução fora do container: Node.js 22+ e npm
+## 1. 📌 Visão geral do projeto
 
-## Execução local com Docker Compose
+### Stack e responsabilidades
 
-Em um ambiente novo, copie o exemplo e confira a configuração antes de iniciar:
+| Componente | Responsabilidade |
+| --- | --- |
+| NestJS / Node.js | API HTTP, validação, casos de uso e worker RabbitMQ. |
+| MySQL / TypeORM | Pedidos, itens, estoque, histórico de execuções e outbox transacional. Migrations versionadas aplicam o schema. |
+| RabbitMQ | Transporte assíncrono, filas de retry com atraso e dead-letter queue (DLQ). |
+| Keycloak | Emissão de access tokens. A API valida tokens como *Resource Server*; não faz login nem guarda senhas. |
+| Prometheus / Grafana | Coleta e visualização de métricas e regras de alerta locais. |
+| Loki / Alloy | Agregação local dos logs JSON dos containers. |
+| OpenTelemetry / Collector / Tempo | Propagação, exportação e consulta de traces. |
 
-```bash
-cp .env.example .env
-docker compose config --quiet
-docker compose up --build -d
-docker compose ps
+### Organização do código
+
+- `src/domain/`: entidades, contratos de repositório, eventos e regras do domínio; não depende de NestJS, TypeORM ou RabbitMQ.
+- `src/application/`: casos de uso que orquestram pedidos, eventos e processamento.
+- `src/infrastructure/`: persistência TypeORM, entidades, migrations e datasource.
+- `src/presentation/`: controllers, DTOs, validação e documentação HTTP/Swagger.
+- `src/queue/`: integração RabbitMQ, dispatcher da outbox, consumer e políticas de retry.
+- `src/auth/` e `src/observability/`: autenticação/autorização e instrumentação transversal.
+- `test/`: testes E2E e de aceitação; `observability/`: configurações versionadas da stack local.
+
+### Fluxo geral de pedido
+
+O diagrama mostra o caminho do pedido. A gravação do pedido e do evento na outbox participa da mesma transação MySQL; só depois um dispatcher publica no RabbitMQ.
+
+```mermaid
+flowchart LR
+  C[Cliente HTTP] --> API[NestJS: valida e executa caso de uso]
+  API --> TX[(Transação MySQL)]
+  TX --> O[Pedido PENDING]
+  TX --> OB[Evento na outbox]
+  OB --> D[Dispatcher da outbox]
+  D -->|publisher confirm| Q[(RabbitMQ: order.created)]
+  Q --> W[Consumer]
+  W -->|evento atual| R[Reserva atômica de estoque]
+  R -->|sucesso| P[Pedido PROCESSED]
+  R -->|falha permanente| F[Pedido FAILED / DLQ]
 ```
 
-O Compose aguarda MySQL e RabbitMQ saudáveis, executa as migrations pelo
-serviço `migrate` e inicia a API depois. A configuração padrão do Compose é para desenvolvimento local: a API usa
-`NODE_ENV=development` e `AUTH_ENABLED=false`. Esse modo é explicitamente
-desprotegido e não deve ser publicado. Em produção, `NODE_ENV=production`
-rejeita `AUTH_ENABLED=false` e exige configuração HTTPS do Keycloak. As
-credenciais de `.env.example` não devem ser usadas em produção.
+## 2. 🚀 Início rápido (Docker local)
 
-Portas publicadas no host:
+### Pré-requisitos
 
-- API: `3000` (`API_PORT`)
-- MySQL: `3306` (`MYSQL_PORT`)
-- RabbitMQ AMQP: `5672` (`RABBITMQ_PORT`)
-- RabbitMQ Management: `15672` (`RABBITMQ_MANAGEMENT_PORT`)
+- Docker Engine 24 ou superior.
+- Docker Compose v2, invocado como `docker compose`.
+- Para desenvolver sem Docker: Node.js 22 ou superior e npm.
 
-Dentro da rede Compose, os serviços se resolvem por `mysql` e `rabbitmq`; fora
-dela, use `localhost`. Os dados locais de MySQL e RabbitMQ ficam em volumes
-persistentes.
+### Subir a aplicação
+
+1. Copie o arquivo de exemplo. Ele contém configuração local de desenvolvimento, não credenciais para produção:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Valide a interpolação do Compose antes de iniciar. `--quiet` valida sem imprimir a configuração expandida:
+
+   ```bash
+   docker compose config --quiet
+   ```
+
+3. Construa as imagens e inicie os serviços em segundo plano. O Compose espera MySQL e RabbitMQ saudáveis, executa migrations e então inicia a API:
+
+   ```bash
+   docker compose up --build -d
+   ```
+
+4. Confira o estado dos containers; `migrate` deve terminar com sucesso e os serviços persistentes devem ficar em execução:
+
+   ```bash
+   docker compose ps
+   ```
+
+### Portas locais
+
+| Serviço | Porta padrão no host | Variável de override |
+| --- | ---: | --- |
+| API | `3000` | `API_PORT` |
+| MySQL | `3306` | `MYSQL_PORT` |
+| RabbitMQ AMQP | `5672` | `RABBITMQ_PORT` |
+| RabbitMQ Management | `15672` | `RABBITMQ_MANAGEMENT_PORT` |
+| Grafana (profile opcional) | `3001` | fixa no Compose |
+| Prometheus (profile opcional) | `9090` | fixa no Compose |
+| Loki (profile opcional) | `3101` no host (`3100` no container) | fixa no Compose |
+| Tempo (profile opcional) | `3200` | fixa no Compose |
+
+O Compose publica as portas de desenvolvimento em loopback. Entre containers, use os nomes `mysql` e `rabbitmq`; no host, use `localhost`. RabbitMQ Management já vem na imagem `rabbitmq:3.13-management` e pode ser acessado em <http://localhost:15672>. Use `RABBITMQ_USER` e `RABBITMQ_PASSWORD` do `.env`; se não estiverem definidos, os valores de desenvolvimento do Compose são `app` / `app`.
+
+Para acompanhar a API e parar os serviços mantendo os dados, use:
 
 ```bash
 docker compose logs -f api
 docker compose down
 ```
 
-`docker compose down` para os serviços desse projeto sem apagar os volumes.
-`docker compose down -v` também apaga os dados e é irreversível; confira o
-projeto Compose atual antes de usá-lo. Não execute limpeza enquanto outra
-pessoa ou processo estiver usando a mesma stack.
+O primeiro comando acompanha os logs do container `api`; o segundo interrompe os serviços sem remover volumes. **Não use `docker compose down -v` como limpeza rotineira:** `-v` também apaga os volumes persistentes de MySQL e RabbitMQ, eliminando os dados locais. Só faça isso quando a perda dos dados estiver intencional e após confirmar qual projeto Compose será afetado.
 
-## Migrations
+### Primeiro teste da API
 
-`synchronize` não é usado com `NODE_ENV=production`. A migration é uma etapa
-explícita do Compose e também pode ser executada manualmente após o build:
+Por padrão, a autenticação fica desativada para facilitar o desenvolvimento local. Esse modo não deve ser exposto. O Swagger mostra os contratos e exemplos em <http://localhost:3000/docs>.
+
+Este exemplo cria um pedido; com a configuração padrão, recebe `201 Created` e um objeto cujo estado inicial é `PENDING`:
 
 ```bash
-docker compose run --rm migrate
-# ou, fora do Docker:
-npm run build
-npm run migration:run
+curl -i http://localhost:3000/orders \
+  -H 'Content-Type: application/json' \
+  -H 'X-Request-Id: 7ac4c889-f474-4eef-9c8a-8a234c7ed301' \
+  -d '{"customerName":"Alice Silva","items":[{"productName":"Keyboard","quantity":2,"price":100},{"productName":"Mouse","quantity":1,"price":40}]}'
 ```
 
-Não execute `migration:revert` sem confirmar o impacto no banco.
+Correlacione a chamada usando o header `X-Request-Id` da resposta. O consumer atualiza o pedido de forma assíncrona; consulte depois `GET /orders/:id` para verificar o estado final.
 
-## Testes
+## 3. 🔄 Ciclo de vida do pedido e mensageria
 
-Os testes unitários e o E2E local usam SQLite em memória. O comando E2E está
-configurado para Jest/TypeScript ESM e pode ser executado independentemente da
-stack MySQL/RabbitMQ:
+### Outbox e entrega at-least-once
 
-```bash
-npm ci --legacy-peer-deps
-npm run lint
-npm run build
-npm test -- --runInBand
-npm run test:e2e -- --runInBand
+O **Transactional Outbox** evita o problema de gravar um pedido no banco e falhar ao publicar seu evento (ou publicar um evento cujo pedido foi revertido). O pedido e o evento são persistidos na mesma transação MySQL. Um dispatcher publica eventos pendentes usando *publisher confirms* e só marca `publishedAt` após confirmação do RabbitMQ. Se a publicação falhar, o evento continua pendente para nova tentativa.
+
+A garantia é **at-least-once**, não *exactly-once*: se a aplicação cair após a confirmação do RabbitMQ e antes de atualizar `publishedAt`, o evento pode ser publicado novamente. O consumer é idempotente para o efeito de negócio: uma reserva de estoque e a atualização do pedido são transacionais, usam lock e só atualizam estoque se houver saldo suficiente. Assim, uma reentrega de pedido terminal não debita estoque outra vez; uma falha de estoque reverte toda a reserva.
+
+Os contratos `OrderCreatedEvent` e `OrderReprocessRequestedEvent` são versionados e independentes de NestJS, TypeORM e RabbitMQ. O caso de uso cria o evento, a persistência grava-o na outbox com o pedido, e apenas o dispatcher conhece a publicação no broker.
+
+### Geração, execução e reprocessamento
+
+`generation` identifica a geração do pedido e `processingRun` identifica a execução associada. Ambos começam em `1`. Ao reprocessar um pedido `FAILED`, a API incrementa os dois, limpa o motivo da falha, muda o estado para `PENDING` e grava o novo evento na outbox dentro da mesma transação. A tabela `order_processing_runs` mantém a origem (`CREATE` ou `MANUAL`), o estado, timestamps e o `eventId` associado; quando disponível, `requestedBy` guarda somente o claim `sub`, nunca o token.
+
+`POST /orders/:id/reprocess` exige o papel `order-admin` e aceita somente pedidos `FAILED`. Retorna `202`; um ID malformado retorna `400`, pedido inexistente `404`, e estado diferente de `FAILED` `409`. Se a causa original não foi corrigida — por exemplo, continua faltando estoque — o novo processamento pode falhar novamente. A geração atual protege contra eventos antigos: o consumer confirma mensagens que não correspondam ao par atual `generation`/`processingRun` sem reservar estoque.
+
+### Retry, falhas permanentes e DLQ
+
+Falhas transitórias recebem três tentativas adicionais com atrasos fixos de **1 s, 5 s e 15 s**. Esse é um backoff escalonado, não exponencial. Falhas permanentes — como evento inválido, pedido inexistente ou estoque insuficiente — não são repetidas: a mensagem vai para a DLQ e, quando há pedido, o motivo é persistido como `FAILED`. Após esgotar as tentativas transitórias, a execução também é marcada `FAILED` e a mensagem segue para a DLQ.
+
+```mermaid
+flowchart TD
+  Q[order.created] --> C[Consumer processa]
+  C -->|Sucesso| OK[PROCESSED e ACK]
+  C -->|Permanente: evento inválido, pedido inexistente ou estoque| DLQ[order.created.dlq]
+  C -->|Transitória, falha inicial| R1[retry.1: TTL 1 s]
+  R1 --> Q
+  Q -->|Nova falha transitória| R2[retry.2: TTL 5 s]
+  R2 --> Q
+  Q -->|Nova falha transitória| R3[retry.3: TTL 15 s]
+  R3 --> Q
+  Q -->|Falha após três retries adicionais| FAIL[Pedido FAILED]
+  FAIL --> DLQ
+  DLQ -->|Causa corrigida e pedido FAILED| MANUAL[POST /orders/:id/reprocess]
+  MANUAL -->|Nova geração + evento na outbox| Q
 ```
 
-O E2E sobe um servidor JWKS local e gera chaves RSA efêmeras; não acessa
-Keycloak nem usa tokens/chaves do ambiente. A configuração `AUTH_ENABLED=false`
-dos testes unitários e da aceitação real é explícita e serve apenas para cobrir
-fluxos que não são testes de autenticação.
+| Situação | Tratamento |
+| --- | --- |
+| Falha transitória durante processamento | Retry em `order.created.retry.1`, `.retry.2` e `.retry.3`, com TTL de 1 s, 5 s e 15 s. |
+| Erro após as três tentativas adicionais | Pedido marcado `FAILED` e mensagem encaminhada à DLQ. |
+| Estoque insuficiente | Falha permanente, transação de reserva revertida, pedido `FAILED` e mensagem na DLQ; sem retry automático. |
+| Evento inválido ou pedido inexistente | Falha permanente e DLQ; não há processamento automático. |
+| Evento de geração/run obsoleta ou pedido já terminal | Consumer confirma a mensagem sem repetir a reserva de estoque. |
+| Reprocessamento manual | Disponível apenas para pedido `FAILED`; exige que a causa seja corrigida antes da nova tentativa. |
 
-O E2E cobre também o contrato de `POST /orders/:id/reprocess` (papel,
-`202`/`400`/`404`/`409` e gravação transacional da nova mensagem na outbox).
-A aceitação Compose com MySQL/RabbitMQ valida o reprocessamento de um pedido
-realmente `FAILED`, a conclusão da nova geração e o descarte de uma mensagem
-atrasada da geração anterior sem novo débito de estoque.
-Também confere o histórico de criação/falha/reprocessamento, sua correlação
-com as linhas da outbox e a atualização terminal da tentativa no MySQL.
+### Endpoints e exemplos de contrato
 
-A flag `--legacy-peer-deps` também é usada no Dockerfile: `@nestjs/swagger@12`
-declara peer de NestJS 12, enquanto o projeto usa NestJS 11. Sem a flag, `npm ci`
-faz falhar a resolução de dependências.
-
-Para testar a integração real, `npm run test:acceptance:compose` cria MySQL e
-RabbitMQ temporários e executa migrations, lint, build, testes unitários e
-aceitação com a aplicação conectada aos dois serviços. O script usa o projeto
-Compose fixo `order-api-p0-acceptance`, sem portas publicadas e sem volumes
-persistentes; ao terminar (inclusive em caso de falha), remove os recursos
-desse projeto. Ele não toca nos volumes do Compose local `order-api`. Não rode
-duas execuções desse script simultaneamente nem mantenha outro ambiente usando
-o mesmo projeto de aceitação, pois a limpeza é deliberadamente restrita a esse
-nome de projeto.
-
-O comando mais abrangente da suíte isolada é:
-
-```bash
-npm run test:acceptance:compose
-```
-
-Também é possível executar apenas `npm run test:acceptance` quando já houver
-MySQL migrado e RabbitMQ acessíveis pelas variáveis `DB_TYPE=mysql`, `DB_HOST`,
-`DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_NAME`, `RABBITMQ_ENABLED=true` e
-`RABBITMQ_URL`. Sem esses serviços, a aceitação falha intencionalmente em vez
-de simular o broker ou o banco.
-
-## Publicação confiável e processamento
-
-`POST /orders` persiste pedido e evento `order.created` na tabela outbox dentro
-da mesma transação MySQL. Assim, ambos são gravados ou revertidos juntos. Um
-dispatcher consulta eventos pendentes em lotes e publica no RabbitMQ usando
-publisher confirms; só então registra `publishedAt`. Falha de publicação
-mantém o evento pendente para nova tentativa. Há reconexão ao RabbitMQ e os
-erros de dispatch/consumer são enviados aos logs da aplicação.
-
-Os contratos de domínio `OrderCreatedEvent` e
-`OrderReprocessRequestedEvent` são versionados (`version: 1`) e não dependem de
-NestJS, TypeORM ou RabbitMQ. A aplicação cria esses eventos; a persistência
-grava o evento serializado na outbox na mesma transação que o pedido; somente o
-dispatcher conhece o publisher RabbitMQ. Portanto, o request não publica
-diretamente no broker e não há dual-write pedido/broker.
-
-A entrega é **at-least-once**, não exactly-once: uma queda depois do confirm do
-broker e antes da atualização da outbox pode causar publicação duplicada. O
-consumer reconhece pedidos já terminais (`PROCESSED`/`FAILED`) sem repetir a
-reserva. A reserva roda em transação MySQL, serializa o processamento do pedido
-com lock e atualiza cada produto condicionalmente (`stock >= quantidade`). Se
-algum item não tiver saldo, toda a transação de reserva é revertida, inclusive
-as alterações dos itens anteriores, antes de registrar a falha do pedido.
-
-O pedido mantém `generation` e `processingRun`, ambos iniciados em `1`. O
-endpoint `POST /orders/:id/reprocess` exige `order-admin` e só aceita pedidos
-`FAILED`: sob lock pessimista no MySQL, muda o pedido para `PENDING`, limpa o
-motivo de falha, incrementa os dois contadores e grava o evento
-`order.reprocess.requested` na mesma transação. Retorna `202`; pedido
-inexistente retorna `404`, estado diferente de `FAILED` retorna `409` e ID
-malformado retorna `400`. Duas solicitações concorrentes são serializadas:
-apenas uma transição pode sair de `FAILED`, a outra observa `PENDING` e recebe
-`409`. A geração é incluída nas mensagens e o consumer confirma sem processar
-eventos de gerações antigas, inclusive mensagens atrasadas em retry. O estado
-e os contadores também são retornados nas consultas do pedido.
-
-Cada geração/processamento também tem uma linha persistente em
-`order_processing_runs`, com unicidade `(orderId, generation, processingRun)`.
-`source` distingue `CREATE` e `MANUAL`; `eventId` referencia o UUID da linha
-outbox correspondente e `eventType` registra o tipo publicado. A linha nasce
-como `PENDING` na mesma transação que grava pedido/reprocessamento e outbox.
-O consumer atualiza o estado terminal e `completedAt` da tentativa na mesma
-transação que atualiza o pedido; `startedAt` é preenchido na primeira entrega
-válida e retries não criam novas linhas nem reiniciam o horário. Pedidos
-anteriores à migration recebem uma linha inferida de seu estado e timestamps,
-sem `eventId` (não se inventa vínculo para uma mensagem que talvez não exista).
-`requestedBy` guarda somente o claim JWT `sub` na criação/reprocessamento
-quando presente; não armazena o token. Execuções sem identidade autenticada
-registram `NULL`. Não há endpoint de leitura do histórico nesta entrega.
-
-Em deploy progressivo, a migration cria tabela/índices e faz o backfill inicial
-sem alterar/remover colunas antigas. Binaries antigos continuam compatíveis
-com a tabela adicional, mas não gravam tentativas: após drenar todas as
-instâncias antigas, execute uma reconciliação idempotente para cobrir os
-pedidos eventualmente criados nesse intervalo (o mesmo `INSERT ... SELECT` do
-backfill, com `WHERE NOT EXISTS` pela chave única), antes de considerar a
-auditoria completa. Faça backup e monitore tempo/locks do backfill em bases
-grandes. O `down` remove exclusivamente a tabela nova e, portanto, descarta
-todo o histórico.
-
-Falhas de evento inválido, pedido inexistente e estoque insuficiente são
-permanentes: não são repetidas e seguem para a DLQ; quando há pedido, o motivo
-é persistido como `FAILED`. As demais falhas de processamento são tratadas
-como transitórias e tentadas novamente por filas RabbitMQ com TTL de 1, 5 e 15
-segundos. A publicação no retry também usa publisher confirm antes de confirmar
-a mensagem original. Depois das três tentativas adicionais, o pedido é marcado
-`FAILED` e a mensagem vai para a DLQ.
-
-## Observabilidade e operação
-
-Os logs da aplicação são JSON em stdout/stderr. O middleware aceita
-`X-Request-Id` apenas quando é um UUID válido; outros valores (inclusive
-strings longas, token-like ou IDs sem formato UUID) são substituídos por UUID.
-A resposta sempre
-retorna `X-Request-Id`. O identificador é propagado por AsyncLocalStorage,
-gravado na outbox/evento quando o pedido nasce via HTTP e enviado nos headers
-RabbitMQ. Eventos anteriores à mudança continuam válidos e podem não ter
-`requestId`, `traceparent` ou `eventId` no payload.
-
-Os logs dos marcos `order.create.accepted`, `order.reprocess.accepted`,
-`outbox.event.published`/`outbox.event.publish_failed` e
-`consumer.attempt.started`/`succeeded`/`failed`/
-`retry_scheduled`/`message.stale` carregam os IDs aplicáveis
-(`requestId`, `eventId`, `orderId`, `generation`, `processingRun`,
-`eventType`). O sistema não registra corpo de pedido, itens, nomes de cliente,
-JWT, credenciais nem conteúdo integral da mensagem. A `failureReason` continua
-persistida para diagnóstico funcional; não a copie para canais de log/ticket
-sem avaliar se contém informação sensível.
-
-### Subir o profile local de observabilidade
-
-O profile não é iniciado no `docker compose up` padrão. Para ativar os
-exporters OTLP e os serviços de observabilidade:
-
-```bash
-OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
-  docker compose --profile observability up --build -d
-docker compose --profile observability ps
-docker compose --profile observability logs -f api prometheus loki alloy otel-collector tempo
-```
-
-Endpoints publicados apenas em loopback:
-
-| Serviço | URL local | Uso |
+| Método e rota | Acesso | Resultado principal |
 | --- | --- | --- |
-| Prometheus | http://localhost:9090 | métricas, regras e alertas avaliados |
-| Grafana | http://localhost:3001 | dashboard `Order API / Order API - Operações` e Explore |
-| Loki | http://localhost:3101 | logs JSON do container API, retenção de 72 horas |
-| RabbitMQ Management | http://localhost:15672 | filas e consumers |
-| API `/metrics` | http://localhost:3000/metrics | scrape Prometheus; não é rota health |
+| `POST /orders` | `order-admin` | Cria pedido `PENDING`, persiste evento na outbox e retorna `201`. |
+| `POST /orders/:id/reprocess` | `order-admin` | Inicia nova geração de pedido `FAILED`; retorna `202`. |
+| `GET /orders/:id` | `order-user` | Retorna pedido, itens, estado e números da execução. |
+| `GET /orders?page=1&limit=10` | `order-user` | Retorna pedidos paginados. |
 
-No primeiro acesso local ao Grafana, troque a senha de bootstrap imediatamente
-e use essa instância somente para desenvolvimento local. As credenciais de
-MySQL e RabbitMQ são as definidas localmente pelas variáveis `MYSQL_*` e
-`RABBITMQ_*` no `.env`; não copie valores de exemplo para produção. As portas
-do MySQL, AMQP, API, Management, Prometheus e Grafana estão limitadas a
-`127.0.0.1` pelo Compose. O endpoint Prometheus do RabbitMQ
-(`15692`) e o OTLP (`4318`) não são publicados no host, só ficam acessíveis na
-rede Compose. Tempo mantém traces por até 72 horas; Prometheus, Grafana, Tempo e Loki usam
-volumes persistentes e podem conter dados operacionais. Loki também persiste
-logs por até 72 horas.
+### Caminho das requisições HTTP por cenário
 
-O Alloy usa a API Docker para descobrir exclusivamente containers com labels
-Compose do projeto atual e serviço `api`; os IDs ficam como structured
-metadata no Loki, não como labels indexadas. O socket Docker concede poder
-elevado, efetivamente equivalente a controle do daemon local; o mount `:ro`
-não limita as operações da API. Portanto, este profile é apenas para uma
-máquina de desenvolvimento com daemon isolado, não para ambiente compartilhado
-ou produção. Se não aceitar esse risco, não ative Alloy/profile; use os logs
-diretamente com `docker compose logs`.
+Os fluxos abaixo separam a resposta síncrona da API do processamento assíncrono. Em todos os endpoints, o middleware estabelece o `requestId`; com autenticação habilitada, o JWT é validado antes da autorização por role. Em `development`/`test`, `AUTH_ENABLED=false` permite passar pelo guard sem token.
 
-Em ambiente `production`, `METRICS_TOKEN` é obrigatório e deve ter pelo menos
-32 caracteres aleatórios. O scrape da API deve enviar esse segredo em
-`X-Metrics-Token` e estar restrito por rede/firewall; o token não deve ser
-colocado em arquivos versionados nem em argumentos de linha de comando
-persistentes. O Prometheus do profile local não configura autenticação de
-scrape: não defina `METRICS_TOKEN` no ambiente local se quiser usá-lo sem
-ajustar também uma credencial de scrape protegida. `/metrics` não tem JWT de
-propósito para permitir scrape; com token configurado, a rota exige o token.
-Não existe rota HTTP `/health`.
+#### Criar pedido — `POST /orders`
 
-Os spans HTTP seguem `traceparent`/`tracestate`; os spans
-`outbox.publish` e `order.process` preservam a relação com a requisição e
-atravessam os headers AMQP, inclusive retries. No Grafana, abra **Explore**:
-use Loki para buscar logs JSON e Tempo para filtrar por `request.id`.
-Métricas não usam IDs individuais como labels. Foram adicionadas métricas HTTP,
-resultados/duração de processamento, outbox pendente/idade/tentativas e
-resultados de consumer/retry. O plugin `rabbitmq_prometheus` fornece métricas
-da fila, incluindo ready, unacked e consumers. As regras ficam em
-`observability/prometheus/alerts.yml` e podem ser consultadas em
-`http://localhost:9090/alerts`: backlog da outbox/fila principal, outbox com
-mais de 10 minutos, mensagens na DLQ, proporção elevada de falhas e scrape
-indisponível. As regras são avaliadas localmente no Prometheus; não há
-Alertmanager nem integração de notificação configurada.
-
-### Runbook: pedido `X` continua `PENDING` há 10 minutos
-
-1. Confirme o ID do pedido e o horário/ambiente. Não use o corpo completo do
-   pedido para buscar diagnóstico.
-2. Faça as consultas abaixo em uma sessão MySQL somente leitura. Os campos de
-   saída não incluem nome do cliente, itens nem payload completo:
-
-```sql
-START TRANSACTION READ ONLY;
-
-SELECT id, status, generation, processingRun, failureReason, createdAt, updatedAt,
-       TIMESTAMPDIFF(MINUTE, createdAt, CURRENT_TIMESTAMP) AS ageMinutes
-FROM orders
-WHERE id = X;
-
-SELECT orderId, generation, processingRun, source, eventId, eventType, status,
-       failureReason, startedAt, completedAt, createdAt
-FROM order_processing_runs
-WHERE orderId = X
-ORDER BY generation, processingRun;
-
-SELECT eventId, eventType, requestId, attempts, publishedAt, createdAt
-FROM outbox_events
-WHERE eventType IN ('order.created', 'order.reprocess.requested')
-  AND JSON_EXTRACT(payload, '$.orderId') = X
-ORDER BY id DESC;
-
-COMMIT;
+```mermaid
+flowchart TD
+  A[Cliente envia POST /orders] --> B[Middleware: requestId e contexto]
+  B --> C{JWT habilitado e válido?}
+  C -->|Não autorizado| U[401: token ausente ou inválido]
+  C -->|Sim ou auth local desabilitada| D{Possui order-admin?}
+  D -->|Não| F[403: role insuficiente]
+  D -->|Sim| E{DTO válido?}
+  E -->|Não| V[400: validação rejeita entrada]
+  E -->|Sim| G[Controller chama caso de uso]
+  G --> H[Localiza produtos; cria os ausentes com estoque inicial 5]
+  H --> I[Calcula total do pedido]
+  I --> J[(Transação MySQL: pedido PENDING + outbox + processing run)]
+  J -->|Falha/rollback| X[Erro HTTP; nada é publicado]
+  J -->|Commit| K[201 Created com pedido PENDING]
+  J -. processo independente da resposta .-> L[Dispatcher lê evento pendente]
+  L --> M{RabbitMQ confirma publicação?}
+  M -->|Não| N[Evento permanece pendente; dispatcher tenta novamente]
+  M -->|Sim| O[Consumer valida evento e geração atual]
+  O --> P{Reserva de estoque concluída?}
+  P -->|Sim| Q[Transação grava PROCESSED e ACK]
+  P -->|Falha permanente| R[Grava FAILED e envia mensagem à DLQ]
+  P -->|Falha transitória| S[Retry com atraso; após esgotar, FAILED / DLQ]
 ```
 
-   Substitua `X` por um inteiro validado. A consulta da outbox usa o JSON do
-   evento apenas para filtrar o ID; não selecione nem compartilhe o payload.
-3. Interprete os tempos/estados junto com a fila:
-   - `orders.status=PENDING`, execução `PENDING` com `startedAt IS NULL`:
-     ainda não há início válido do consumer. Se a outbox não tem linha ou
-     `publishedAt IS NULL`, investigue dispatcher, erro de publicação e
-     conectividade do broker.
-   - `publishedAt` preenchido comprova que o dispatcher recebeu publisher
-     confirm e atualizou o MySQL; **não** comprova que o consumer processou a
-     mensagem. Compare fila pronta, consumers e retry.
-   - `outbox_events.attempts` conta falhas de publicação registradas no banco,
-     e não entregas RabbitMQ nem confirmações bem-sucedidas. A métrica
-     `order_outbox_publication_attempts_total` contabiliza as tentativas do
-     dispatcher.
-   - `startedAt` preenchido indica que uma entrega válida iniciou aquela
-     execução. Retries não reiniciam esse timestamp. `completedAt` preenchido
-     e status terminal indicam resultado persistido; `failureReason` explica
-     uma execução `FAILED`.
-   - Uma geração/run anterior pode estar obsoleta após reprocessamento. Use
-     sempre o par atual `generation`/`processingRun`; o consumer reconhece e
-     confirma entregas antigas sem processá-las.
-4. Abra http://localhost:15672 com as credenciais locais e selecione o vhost
-   `/`, depois **Queues and Streams**. Examine `order.created`,
-   `order.created.retry.1`, `.retry.2`, `.retry.3` e `order.created.dlq`:
-   `Ready` é aguardando entrega; `Unacked` é entregue e ainda não confirmada;
-   `Consumers` deve mostrar o worker conectado. Crescimento de `Ready` com
-   consumers zero aponta para worker/conexão; `Unacked` parado pode indicar
-   processamento suspenso ou demorado; retry crescente indica falha transitória
-   e DLQ com conteúdo requer investigação da razão permanente/esgotamento.
-5. Busque os logs JSON locais pelo `requestId` retornado no header HTTP (ou
-   `eventId`/`orderId`/`generation`):
+A resposta `201` confirma a persistência transacional, não a conclusão da reserva. O cliente consulta o estado final com `GET /orders/:id`. Falha na publicação não desfaz o pedido: a outbox preserva o evento para nova tentativa.
 
-```bash
-docker compose logs --since 30m --no-color api | grep -F '"requestId":"<uuid>"'
-docker compose logs --since 30m --no-color api | grep -F '"eventId":"<uuid>"'
+#### Consultar pedido — `GET /orders/:id` ou `GET /orders`
+
+```mermaid
+flowchart TD
+  A[Cliente envia GET] --> B[Middleware: requestId e contexto]
+  B --> C{JWT habilitado e válido?}
+  C -->|Não| U[401]
+  C -->|Sim ou auth local desabilitada| D{Possui order-user?}
+  D -->|Não| F[403]
+  D -->|Sim| E{Rota e parâmetros válidos?}
+  E -->|ID inválido ou paginação inválida| V[400]
+  E -->|GET /orders/id| G[Busca pedido e itens no MySQL]
+  E -->|GET /orders| H[Busca página e total no MySQL]
+  G -->|Não encontrado| N[404]
+  G -->|Encontrado| O[200 com pedido, estado e itens]
+  H --> P[200 com data, total, page e limit]
 ```
 
-   No Grafana **Explore**, escolha Loki e use
-   `{job="order-api"} | requestId="<uuid>"` (ou filtre `eventId`/`orderId`).
-   Os IDs são structured metadata e não labels indexadas. Para traces, selecione
-   Tempo e filtre o atributo `request.id` para abrir o trace HTTP e seus spans
-   `outbox.publish` e `order.process`. Sem request ID em evento antigo,
-   correlacione por `eventId`/IDs de execução e timestamps; não presuma que
-   evento legado possui trace.
-6. Consulte as séries do dashboard/Prometheus:
-   `order_outbox_pending`,
-   `order_outbox_oldest_pending_age_seconds`,
-   `order_outbox_publication_attempts_total`,
-   `order_processing_results_total`,
-   `order_consumer_results_total`,
-   `rabbitmq_detailed_queue_messages_ready`,
-   `rabbitmq_detailed_queue_messages_unacked` e
-   `rabbitmq_detailed_queue_consumers` (famílias detalhadas do plugin 3.13).
-   Use as regras ativas em `/alerts` como sinais,
-   não como prova isolada da causa.
-7. A inspeção do Management deve ser somente leitura. Não use **Get messages**,
-   ack, requeue, purge ou alteração de bindings como tentativa de diagnóstico:
-   isso pode consumir uma mensagem, alterar sua ordem, duplicar processamento
-   ou apagar evidência. Não faça `nack` manual nem requeue silencioso. Não
-   apague/republique a linha da outbox. Para pedido já persistido como
-   `FAILED`, o caminho suportado é `POST /orders/:id/reprocess` com papel
-   `order-admin`; para fila/DLQ, registre evidência e valide um procedimento
-   operacional revisado antes de qualquer intervenção.
+`GET /orders/:id` lê também os itens relacionados e retorna `404` se o pedido não existir. A listagem aceita `page >= 1` e `1 <= limit <= 100`; valores fora dos limites retornam `400`.
 
-### Limitações operacionais conhecidas
+#### Reprocessar pedido — `POST /orders/:id/reprocess`
 
-- A outbox não tem mecanismo distribuído de claim/lease: várias réplicas da
-  API podem publicar o mesmo evento pendente. O fluxo tolera redelivery, mas
-  isso não substitui uma estratégia de coordenação para escalar dispatchers.
-- O profile local avalia regras Prometheus, mas não envia notificações; métricas
-  RabbitMQ dependem de `rabbitmq_prometheus` e os spans são exportados apenas
-  quando o endpoint OTLP está configurado. Não há instrumentação de consultas
-  SQL/TypeORM. O novo endpoint reprocessa somente
-  pedidos cuja falha já foi persistida no banco;
-  ele não consome nem altera diretamente mensagens da DLQ.
-- Os atrasos de retry são fixos e o dispatch da outbox volta a tentar no ciclo
-  seguinte; não há política operacional configurável nem retenção/limpeza da
-  outbox documentada.
-- O Compose padrão é desenvolvimento local e inicia sem autenticação por
-  configuração explícita. A autenticação JWT fica obrigatória em
-  `NODE_ENV=production`, mas implantação, realm e disponibilidade do Keycloak
-  precisam ser operados pelo ambiente consumidor.
-
-## Desenvolvimento sem Docker
-
-```bash
-npm ci --legacy-peer-deps
-cp .env.example .env
-npm run start:dev
+```mermaid
+flowchart TD
+  A[Operador envia POST /orders/id/reprocess] --> B[Middleware: requestId e contexto]
+  B --> C{JWT habilitado e válido?}
+  C -->|Não| U[401]
+  C -->|Sim ou auth local desabilitada| D{Possui order-admin?}
+  D -->|Não| F[403]
+  D -->|Sim| E{ID inteiro válido?}
+  E -->|Não| V[400]
+  E -->|Sim| G[(Transação MySQL bloqueia pedido para escrita)]
+  G --> H{Pedido existe?}
+  H -->|Não| N[404]
+  H -->|Sim| I{Status atual é FAILED?}
+  I -->|Não| X[409: pedido não reprocessável]
+  I -->|Sim| J[Incrementa generation e processingRun; limpa failureReason; muda para PENDING]
+  J --> K[(Mesma transação: grava evento de reprocessamento na outbox e nova processing run)]
+  K -->|Rollback| Z[Erro HTTP; estado anterior preservado]
+  K -->|Commit| L[202 Accepted com novo estado PENDING]
+  K -. processamento assíncrono .-> M[Dispatcher publica; consumer tenta a nova geração]
+  M --> R{Reserva de estoque}
+  R -->|Sucesso| S[PROCESSED]
+  R -->|Falha| T[FAILED; investigar causa e corrigir antes de novo reprocessamento]
 ```
 
-Para executar a API fora dos containers, use `DB_HOST=localhost` e tenha os
-serviços necessários disponíveis. Para os testes unitários/E2E isolados, a
-configuração de teste usa `DB_TYPE=better-sqlite3`, `DB_NAME=:memory:` e
-`RABBITMQ_ENABLED=false`.
+O endpoint responde `202` depois do commit, sem aguardar o RabbitMQ ou a reserva. Reprocessar não corrige a causa original: por exemplo, estoque insuficiente precisa ser resolvido antes da nova tentativa.
 
-## Endpoints
+O Swagger interativo em `/docs` documenta os DTOs, autenticação e respostas HTTP. Exemplo de corpo de `POST /orders`:
 
-- `POST /orders`
-- `POST /orders/:id/reprocess` (papel `order-admin`; somente estado `FAILED`)
-- `GET /orders/:id`
-- `GET /orders?page=1&limit=10`
-- Swagger: `/docs`
+```json
+{
+  "customerName": "Alice Silva",
+  "items": [
+    { "productName": "Keyboard", "quantity": 2, "price": 100 },
+    { "productName": "Mouse", "quantity": 1, "price": 40 }
+  ]
+}
+```
 
-## Autenticação e autorização (Keycloak)
+Exemplo de resposta inicial `201 Created` (os IDs e datas são ilustrativos; o total é calculado pela API):
 
-A API atua como **Resource Server**: não faz login, não recebe senha de usuário
-e não delega autenticação ao endpoint. O cliente obtém um access token no
-Keycloak e envia `Authorization: Bearer <access_token>`. A estratégia NestJS
-Passport valida localmente a assinatura RS256 a partir das chaves públicas
-JWKS e, em seguida, valida `iss`, `aud`, `exp`, `nbf` (quando presente) e os
-claims mínimos `sub` e `exp`. Token ausente, inválido, expirado ou com claims
-incorretos resulta em **401**; token válido sem papel requerido resulta em
-**403**.
+```json
+{
+  "id": 1,
+  "customerName": "Alice Silva",
+  "total": 240,
+  "status": "PENDING",
+  "generation": 1,
+  "processingRun": 1,
+  "failureReason": null,
+  "items": [
+    { "id": 1, "productName": "Keyboard", "quantity": 2, "price": 100 },
+    { "id": 2, "productName": "Mouse", "quantity": 1, "price": 40 }
+  ],
+  "createdAt": "2026-09-25T14:48:27.530Z",
+  "updatedAt": "2026-09-25T14:48:27.530Z"
+}
+```
 
-### Matriz endpoint/papel
+## 4. 🔐 Segurança e autenticação (Keycloak)
 
-| Endpoint          | Papel client exigido |
-| ----------------- | -------------------- |
-| `GET /orders`     | `order-user`         |
-| `GET /orders/:id` | `order-user`         |
-| `POST /orders`    | `order-admin`        |
+A API é um **Resource Server**: o cliente obtém o access token no Keycloak e envia `Authorization: Bearer <token>`. A API não emite tokens nem recebe ou guarda senhas. O guard valida assinatura RS256 usando JWKS e confere `iss`, `aud`, `exp`, `nbf` (quando presente) e claims mínimos `sub` e `exp`. Token ausente, inválido ou com claims incorretos resulta em `401`; token válido sem a role exigida resulta em `403`.
+
+```mermaid
+sequenceDiagram
+  participant Cliente
+  participant Keycloak
+  participant API
+  participant JWKS
+  Cliente->>Keycloak: Authorization Code + PKCE / obtém access token
+  Keycloak-->>Cliente: JWT assinado (iss, aud, exp, roles, kid)
+  Cliente->>API: Requisição + Authorization: Bearer JWT
+  API->>API: Lê kid e valida claims/roles
+  API->>JWKS: Busca chave pública se necessário (kid desconhecido/cache expirado)
+  JWKS-->>API: Chaves públicas
+  API-->>Cliente: 2xx, 401 ou 403
+```
+
+### Matriz de permissões
+
+As roles de cliente são lidas de `resource_access.order-api.roles`. Não há autorização por propriedade/ownership: um usuário com `order-user` pode consultar qualquer pedido.
+
+| Endpoint | Role do client `order-api` |
+| --- | --- |
+| `GET /orders` | `order-user` |
+| `GET /orders/:id` | `order-user` |
+| `POST /orders` | `order-admin` |
 | `POST /orders/:id/reprocess` | `order-admin` |
 
-Os papéis são lidos exclusivamente de
-`resource_access.order-api.roles`. Não há autorização por propriedade/
-ownership de pedido nesta implementação. Não foram criados endpoints PUT ou
-DELETE.
+### Subir e configurar Keycloak local
 
-### Keycloak e configuração
-
-#### Iniciar Keycloak localmente com Docker
-
-O Keycloak não faz parte do Compose da API. Primeiro inicie a stack para criar
-a rede Docker do projeto:
+O Keycloak não faz parte do Compose da API. Inicie primeiro a stack da aplicação para criar a rede Docker; `docker network ls` ajuda a localizar o nome de rede caso o projeto Compose tenha sido renomeado:
 
 ```bash
 docker compose up --build -d
 docker network ls
 ```
 
-Com o nome de rede padrão do projeto (`order-api_default`), inicie o Keycloak
-e publique a porta 8080 no host:
+Na rede padrão `order-api_default`, crie um volume e inicie o Keycloak para desenvolvimento. `start-dev` e as credenciais abaixo são exclusivamente locais:
 
 ```bash
 docker volume create keycloak_data
@@ -455,58 +341,24 @@ docker run -d --name keycloak \
   --hostname=http://localhost:8080
 ```
 
-Se a rede tiver outro nome (por exemplo, porque `COMPOSE_PROJECT_NAME` foi
-alterado), substitua `order-api_default` pelo nome mostrado por
-`docker network ls`. Acompanhe a inicialização com
-`docker logs -f keycloak`; quando estiver pronto, abra
-`http://localhost:8080/admin/` e entre com `admin` / `admin`. Esses dados e o
-modo `start-dev` são somente para desenvolvimento local. O volume
-`keycloak_data` preserva o estado do Keycloak entre reinicializações.
+Se `docker network ls` mostrar outro nome, substitua `order-api_default`. Acompanhe a inicialização e abra o console em <http://localhost:8080/admin/>:
 
-#### Criar realm, client e papéis
+```bash
+docker logs -f keycloak
+```
 
-1. No console administrativo, crie o realm `orders` (seletor de realm no
-   canto superior esquerdo → **Create realm**).
-2. Em **Clients**, crie um client OpenID Connect com o ID `order-api`.
-   Cadastre os papéis de client `order-user` e `order-admin` na aba **Roles**.
-   Para o teste interativo com Postman, deixe **Client authentication** desligado
-   (client público), habilite **Standard flow** e cadastre
-   `https://oauth.pstmn.io/v1/callback` em **Valid redirect URIs**. A API valida
-   access tokens Bearer e não usa o client secret. Em produção, prefira clients
-   separados para a aplicação cliente e para a API/recurso.
-3. Configure um mapper de audiência para incluir `order-api` no claim `aud`
-   dos access tokens: no client scope dedicado do client, adicione um mapper
-   do tipo **Audience**, selecione **Included Client Audience: order-api** e
-   habilite **Add to access token**.
-4. Para testes locais, crie um usuário no realm, defina uma senha não temporária
-   e, em **Role mapping**, atribua os client roles `order-user` e/ou
-   `order-admin` do client `order-api`. Conceda `order-admin` apenas a quem
-   puder criar pedidos.
-5. Para obter um token de usuário no Postman, escolha **OAuth 2.0** →
-   **Get New Access Token** e informe:
-   - Grant Type: **Authorization Code (With PKCE)**; Code Challenge Method:
-     **SHA-256 (S256)**.
-   - Auth URL: `http://localhost:8080/realms/orders/protocol/openid-connect/auth`.
-   - Access Token URL:
-     `http://localhost:8080/realms/orders/protocol/openid-connect/token`.
-   - Client ID: `order-api`; Client Secret: vazio; Callback URL:
-     `https://oauth.pstmn.io/v1/callback`; Scope: `openid`.
+No console administrativo:
 
-   Clique em **Get New Access Token**, autentique o usuário criado no passo 4 e
-   use **Use Token**. No Swagger (`http://localhost:3000/docs`), clique em
-   **Authorize** e informe o access token. Para serviço a serviço, use
-   **Client Credentials** com service account e privilégio mínimo. Não use
-   password grant como fluxo de produção.
+1. Crie o realm `orders`.
+2. Crie o client OpenID Connect `order-api` e as client roles `order-user` e `order-admin`.
+3. Para Postman local, use client público, habilite **Standard flow** e cadastre `https://oauth.pstmn.io/v1/callback` em **Valid redirect URIs**. A API valida access tokens e não usa client secret; em produção, prefira clients separados para aplicação cliente e API.
+4. Configure um mapper **Audience** para incluir `order-api` no claim `aud` dos access tokens; selecione **Included Client Audience: order-api** e habilite **Add to access token**.
+5. Crie um usuário de teste, defina senha não temporária e atribua os client roles necessários em **Role mapping**. Restrinja `order-admin` a operadores autorizados.
+6. No Postman, escolha OAuth 2.0, **Authorization Code (With PKCE)**, método **SHA-256 (S256)**, client ID `order-api`, callback `https://oauth.pstmn.io/v1/callback`, escopo `openid`, Auth URL `http://localhost:8080/realms/orders/protocol/openid-connect/auth` e Token URL `http://localhost:8080/realms/orders/protocol/openid-connect/token`. Obtenha o token e use-o nas chamadas.
 
-Com o `--hostname` usado acima, o issuer local é
-`http://localhost:8080/realms/orders`. O endpoint JWKS acessível pela API em
-container é `http://keycloak:8080/realms/orders/protocol/openid-connect/certs`;
-`keycloak` é o alias na rede Docker. Para rodar a API fora do Docker, use
-`http://localhost:8080` também na URL JWKS.
+Para usar o Swagger, abra `http://localhost:3000/docs`, clique em **Authorize** e informe o access token. Para serviços, prefira **Client Credentials** com service account e privilégios mínimos. Não use password grant como fluxo de produção.
 
-#### Conectar a API ao Keycloak
-
-Para autenticar a API no Compose local, configure estas variáveis no `.env`:
+Configure as variáveis locais abaixo no `.env` para habilitar validação JWT no container da API. O issuer é o endereço usado pelo cliente no token; JWKS usa o alias de rede `keycloak` acessível de dentro do container:
 
 ```dotenv
 NODE_ENV=development
@@ -516,106 +368,219 @@ KEYCLOAK_AUDIENCE=order-api
 KEYCLOAK_JWKS_URI=http://keycloak:8080/realms/orders/protocol/openid-connect/certs
 ```
 
-Recrie a API para aplicar a configuração e confira os logs:
+Recrie a API para aplicar as variáveis. Se a API executar fora do Docker, use `localhost` também na URL JWKS:
 
 ```bash
 docker compose up -d --force-recreate api
 docker compose logs -f api
 ```
 
-O `iss` do token precisa corresponder exatamente a `KEYCLOAK_ISSUER`, e o
-token deve conter `aud: order-api` e o papel de client em
-`resource_access.order-api.roles`. Ao executar a API fora do Docker, troque
-`KEYCLOAK_JWKS_URI` para
-`http://localhost:8080/realms/orders/protocol/openid-connect/certs`.
+O `iss` do token deve corresponder exatamente ao `KEYCLOAK_ISSUER`, e o token deve conter `aud: order-api` e a role em `resource_access.order-api.roles`. Fora de `development`/`test`, issuer e JWKS devem usar HTTPS. Em produção, configure segredos por secret manager ou mecanismo equivalente; não os versione.
 
-Em ambientes não locais, use URLs HTTPS e injete a configuração por ambiente
-ou secret manager (não versionar credenciais ou secrets):
+`AUTH_ENABLED` é ligado por padrão quando omitido e exige as variáveis do Keycloak. `AUTH_ENABLED=false` só pode ser explícito em `development` ou `test`; é recusado em staging/produção e `NODE_ENV=production` também exige `METRICS_TOKEN` com pelo menos 32 caracteres aleatórios. O Compose padrão e `.env.example` são apenas para desenvolvimento.
 
-```dotenv
-NODE_ENV=production
-AUTH_ENABLED=true
-KEYCLOAK_ISSUER=https://<host>/realms/orders
-KEYCLOAK_AUDIENCE=order-api
-KEYCLOAK_JWKS_URI=https://<host>/realms/orders/protocol/openid-connect/certs
-JWKS_CACHE_TTL_MS=600000
-JWKS_TIMEOUT_MS=3000
-JWKS_RATE_LIMIT=10
+O cache JWKS é local por processo (padrão: 10 minutos), com timeout de 3 segundos e limite de 10 atualizações por minuto por instância. Um `kid` desconhecido pode acionar atualização para suportar rotação. Se a atualização necessária falhar, o guard falha de forma fechada (`401`): não aceita assinatura desconhecida nem usa fallback inseguro. Uma chave já cacheada continua utilizável até expirar; por isso, rotação/revogação pode levar até o TTL para refletir em todas as instâncias. Ajuste o TTL ao risco e à janela de rotação. A aplicação não mantém sessão nem chama introspecção.
+
+## 5. 🧪 Testes e qualidade
+
+Os testes unitários e E2E usam SQLite em memória; os testes E2E de autenticação sobem um servidor JWKS local com chaves efêmeras, sem depender de um Keycloak externo. Para instalar as dependências, a flag `--legacy-peer-deps` é necessária porque `@nestjs/swagger@12` declara peer dependency de NestJS 12, enquanto o projeto utiliza NestJS 11:
+
+```bash
+npm ci --legacy-peer-deps
 ```
 
-`AUTH_ENABLED` aceita somente `true`/`false`; quando omitido, autenticação é
-ligada e as variáveis do Keycloak são obrigatórias. Desabilitá-la requer
-`AUTH_ENABLED=false` explícito e só é permitido com `NODE_ENV=development` ou
-`NODE_ENV=test`; é proibido em staging e em `NODE_ENV=production`. O
-`.env.example` e o Compose padrão são exclusivamente desenvolvimento local.
-Para Compose em produção, passe `NODE_ENV=production`, `AUTH_ENABLED=true` e
-os três parâmetros Keycloak; sem eles o processo não inicia protegido.
-Issuer/JWKS devem usar HTTPS fora de `development`/`test`. Os tempos e o limite JWKS são
-validados na inicialização (TTL de 1 s a 24 h, timeout de 100 ms a 30 s e
-limite de 1 a 100 requisições/minuto por instância).
+Execute os comandos abaixo na sequência para validar estilo, compilação, testes unitários e E2E. `--runInBand` faz o Jest executar serialmente, reduzindo concorrência por recursos:
 
-### Fluxos recomendados
+```bash
+npm run lint
+npm run build
+npm test -- --runInBand
+npm run test:e2e -- --runInBand
+```
 
-- **Usuário:** cliente web/mobile separado usa OpenID Connect Authorization
-  Code com PKCE (S256), valida o fluxo no cliente e encaminha o access token à
-  API. Não usar Implicit Flow.
-- **Serviço:** Client Credentials com service account e client role mínimo
-  necessário. Guarde o segredo do client em secret manager e faça rotação.
-- O Resource Owner Password Credentials / password grant não é o fluxo
-  principal recomendado; não colete senha de usuário nesta API.
+Os testes E2E cobrem autenticação e o contrato de reprocessamento (`202`/`400`/`404`/`409`, autorização e gravação transacional na outbox). A aceitação real verifica pedido `FAILED`, nova geração, descarte de mensagem antiga sem novo débito e histórico/outbox no MySQL.
 
-### Cache JWKS, rotação e indisponibilidade
+Para validar a integração real, execute o script de aceitação Compose:
 
-O JWKS client mantém cache em memória por processo (padrão 10 minutos) e
-limita atualização a 10 solicitações/minuto por instância. Um `kid` não
-conhecido provoca busca de JWKS para suportar rotação. A resposta de chave tem
-timeout padrão de 3 segundos. Não há fallback para chave desconhecida ou para
-chave obsoleta após expiração do cache: erro, timeout, HTTP inválido, limite
-atingido ou ausência de `kid` resulta em autenticação negada (**fail-closed**,
-401), sem aceitar token por indisponibilidade do provedor.
+```bash
+npm run test:acceptance:compose
+```
 
-Chaves já obtidas continuam utilizáveis enquanto estiverem válidas no cache,
-mesmo durante uma indisponibilidade do JWKS. Isso melhora disponibilidade,
-mas significa que a revogação/rotação de chave pode levar até o TTL para
-refletir em cada instância. Ajuste o TTL à janela de rotação e risco; reinicie
-instâncias para limpar cache emergencialmente. O cache é local, não
-compartilhado, e não há métrica/alerta JWKS incluído nesta entrega. A emissão e
-renovação de tokens é responsabilidade do cliente/provedor; a API não mantém
-sessão nem chama o endpoint de introspecção.
+O script inicia MySQL e RabbitMQ temporários, executa migrations, lint, build, testes unitários e aceitação, e remove os recursos isolados ao terminar inclusive se houver falha. Usa o projeto fixo `order-api-p0-acceptance`, sem portas publicadas nem volumes persistentes, e não toca nos volumes do Compose local `order-api`. **Não execute duas instâncias simultaneamente nem use esse mesmo projeto para outra stack:** a limpeza é deliberadamente limitada ao nome de projeto de aceitação.
 
-O Swagger em `/docs` declara HTTP Bearer e documenta respostas 401/403. Tokens,
-senhas e segredos não são registrados pela implementação.
+`npm run test:acceptance` pode ser usado quando MySQL migrado e RabbitMQ já estiverem acessíveis pelas variáveis `DB_TYPE=mysql`, `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_NAME`, `RABBITMQ_ENABLED=true` e `RABBITMQ_URL`. Sem os serviços, a aceitação falha intencionalmente; não há simulação do broker ou banco.
 
-## Respostas de arquitetura
+## 6. 📊 Observabilidade e exemplos de logs
 
-1. **Redelivery:** a reserva e a mudança para `PROCESSED` são transacionais; o
-   consumer confirma pedidos em estado terminal sem decrementar estoque de
-   novo. A garantia é idempotência do efeito de negócio, com entrega
-   at-least-once.
-2. **Escala:** consumers podem ser executados em mais instâncias, respeitando
-   os limites de conexão e concorrência do MySQL. Antes de escalar dispatchers
-   da outbox, é necessário acrescentar claim/lease ou locking distribuído para
-   evitar publicações duplicadas.
-3. **Migrações sem downtime:** aplicar mudanças compatíveis em etapas
-   expand/contract (adicionar estrutura opcional, implantar código compatível,
-   migrar dados e só depois remover estrutura antiga), com backup e plano de
-   rollback próprios. O Compose local não valida esse processo operacional.
-4. **Keycloak indisponível:** tokens com `kid` já conhecido e chave ainda em
-   cache seguem verificáveis até expirar o TTL; chaves desconhecidas/expiradas
-   não são aceitas sem atualização bem-sucedida do JWKS. A API nunca aceita um
-   token sem validar a assinatura como fallback.
-5. **Pedido pendente:** correlacionar id do pedido nos registros da aplicação,
-   conferir evento e tentativas na outbox, conectividade/filas no RabbitMQ e
-   os logs do consumer. Atualmente não há métricas/alertas nem ferramenta de
-   replay da DLQ, então a investigação depende dos logs e inspeção dos serviços.
+### Iniciar a stack de observabilidade
 
-## Troubleshooting
+O profile `observability` é opcional e não faz parte do `docker compose up` padrão. Defina o endpoint OTLP para exportar traces e suba os serviços:
 
-- **API não inicia:** consulte `docker compose logs migrate api` e confirme
-  que MySQL e RabbitMQ estão saudáveis.
-- **Porta ocupada:** altere `API_PORT`, `MYSQL_PORT` ou
-  `RABBITMQ_MANAGEMENT_PORT` no `.env`.
-- **Migration já aplicada:** isso é esperado; TypeORM registra o histórico na
-  tabela `migrations`.
-- **Limpeza completa local:** `docker compose down -v` remove também os
-  volumes MySQL/RabbitMQ; revise o projeto selecionado antes de executar.
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+  docker compose --profile observability up --build -d
+```
+
+Confira os containers do profile:
+
+```bash
+docker compose --profile observability ps
+```
+
+Para acompanhar os logs da aplicação e dos coletores durante a inicialização:
+
+```bash
+docker compose --profile observability logs -f api prometheus loki alloy otel-collector tempo
+```
+
+| Serviço | Endereço local | Uso |
+| --- | --- | --- |
+| Prometheus | <http://localhost:9090> | Consultar métricas, regras e alertas avaliados. |
+| Grafana | <http://localhost:3001> | Dashboard `Order API / Order API - Operações` e Explore. Em volume novo, entre com `admin` / `admin` e troque a senha imediatamente; um volume já inicializado preserva a senha definida anteriormente. |
+| Loki | <http://localhost:3101> | Logs JSON coletados dos containers; retenção local de até 72 horas. |
+| Tempo | <http://localhost:3200> | Traces, com retenção local de até 72 horas. |
+| RabbitMQ Management | <http://localhost:15672> | Filas, consumidores, mensagens `Ready` e `Unacked`. |
+| API `/metrics` | <http://localhost:3000/metrics> | Métricas da API; não é endpoint de health check. |
+
+As portas dos serviços locais são publicadas em loopback. O endpoint Prometheus do RabbitMQ (`15692`) e OTLP (`4318`) ficam apenas na rede Compose. Os volumes de Prometheus, Grafana, Loki, Tempo e Alloy persistem dados operacionais. Alloy usa a API pelo socket Docker; **mesmo montado como `:ro`, o socket concede poder elevado sobre o daemon**. Use este profile apenas em uma máquina de desenvolvimento com daemon isolado, nunca em produção/ambiente compartilhado. Se não aceitar esse risco, não inicie o profile e consulte logs diretamente com `docker compose logs`.
+
+Em produção, `/metrics` exige `METRICS_TOKEN` com ao menos 32 caracteres aleatórios e o scrape deve enviar `X-Metrics-Token`, restrito por rede/firewall. Não coloque o token em arquivos versionados ou argumentos persistentes de linha de comando. O Prometheus local não configura token de scrape; não defina `METRICS_TOKEN` no profile local sem configurar também as credenciais de scrape. `/metrics` não usa JWT para permitir scraping protegido pelo token quando configurado. Não existe rota HTTP `/health`.
+
+As métricas cobrem requisições/duração HTTP, resultados e duração do processamento, outbox pendente/idade/tentativas e resultados do consumer. RabbitMQ fornece métricas de filas, incluindo `Ready`, `Unacked` e consumidores. Labels não usam IDs de pedido/evento para evitar cardinalidade alta. Prometheus avalia regras locais para backlog, idade da outbox, mensagens na DLQ, falhas e scrape indisponível; não há Alertmanager nem envio de notificações configurado.
+
+Os spans incluem HTTP, `outbox.publish` e `order.process`. O contexto W3C (`traceparent`/`tracestate`) atravessa mensagens AMQP e retries. Os logs JSON incluem os IDs de correlação aplicáveis; **`traceparent` é propagado em headers/spans, mas não é um campo garantido nos logs atuais**. No Grafana, use **Explore**: filtre logs no Loki e abra os traces no Tempo pelo atributo `request.id`. Não há instrumentação de consultas SQL/TypeORM nesta entrega.
+
+### Exemplos de logs JSON
+
+Os exemplos a seguir mostram o formato emitido pela aplicação, com valores de IDs e timestamps ilustrativos. Os logs não incluem corpo do pedido, nomes de cliente, itens, JWT, senhas, credenciais ou payload integral da mensagem.
+
+Pedido criado e evento aceito pela aplicação:
+
+```json
+{"timestamp":"2026-09-25T14:48:27.530Z","level":"info","message":"order.create.accepted","requestId":"7ac4c889-f474-4eef-9c8a-8a234c7ed301","eventId":"3a126263-758c-4a6b-a9c1-d06495e21e83","eventType":"order.created","orderId":1,"generation":1,"processingRun":1}
+```
+
+Evento publicado pelo dispatcher após confirmação do RabbitMQ:
+
+```json
+{"timestamp":"2026-09-25T14:48:28.101Z","level":"info","message":"outbox.event.published","requestId":"7ac4c889-f474-4eef-9c8a-8a234c7ed301","eventId":"3a126263-758c-4a6b-a9c1-d06495e21e83","orderId":1,"generation":1,"processingRun":1,"eventType":"order.created"}
+```
+
+Erro transitório com retry agendado:
+
+```json
+{"timestamp":"2026-09-25T14:48:28.250Z","level":"warn","message":"consumer.attempt.retry_scheduled","requestId":"7ac4c889-f474-4eef-9c8a-8a234c7ed301","eventId":"3a126263-758c-4a6b-a9c1-d06495e21e83","orderId":1,"generation":1,"processingRun":1,"retry":1,"retryQueue":"order.created.retry.1"}
+```
+
+Mensagem descartada por pertencer a uma geração antiga ou a um pedido já terminal:
+
+```json
+{"timestamp":"2026-09-25T14:49:02.001Z","level":"info","message":"consumer.message.stale","requestId":"7ac4c889-f474-4eef-9c8a-8a234c7ed301","eventId":"3a126263-758c-4a6b-a9c1-d06495e21e83","orderId":1,"generation":1,"processingRun":1,"eventType":"order.created"}
+```
+
+Como interpretar os campos:
+
+- `requestId`: UUID de correlação HTTP. O middleware aceita `X-Request-Id` somente quando é UUID válido; caso contrário, gera outro. A resposta devolve o ID no header `X-Request-Id`.
+- `eventId`: identificador do evento persistido na outbox e propagado ao broker; ajuda a seguir publicação e consumo.
+- `orderId`: chave para consultar o pedido e correlacionar logs/filas; não é usado como label Prometheus.
+- `generation` e `processingRun`: identificam qual tentativa gerou o log e distinguem mensagens antigas após reprocessamento.
+- `traceparent`: contexto de trace W3C; é enviado em headers RabbitMQ e vincula spans entre etapas. Não aparece nos exemplos de JSON porque o logger atual não o registra como campo. Consulte o trace no Tempo.
+
+Eventos anteriores à instrumentação podem não ter `requestId`, `eventId` ou `traceparent`. A `failureReason` é persistida para diagnóstico funcional; avalie possível informação sensível antes de copiá-la para logs, tickets ou outros canais.
+
+## 7. 🛠️ Runbook e resolução de problemas
+
+### Investigar um pedido preso em `PENDING`
+
+Quando um cliente informa que o pedido `X` está `PENDING` há 10 minutos, investigue na ordem abaixo. O objetivo é descobrir em que etapa o fluxo parou sem consumir mensagens nem expor dados do pedido.
+
+1. Confirme o ID inteiro do pedido, ambiente e horário aproximado. Evite usar o corpo do pedido para busca.
+2. Consulte somente leitura o estado do pedido, histórico de execuções e outbox. Substitua `X` por um inteiro validado; a transação encerra explicitamente sem gravar alterações.
+
+   ```sql
+   START TRANSACTION READ ONLY;
+
+   SELECT id, status, generation, processingRun, failureReason, createdAt, updatedAt,
+          TIMESTAMPDIFF(MINUTE, createdAt, CURRENT_TIMESTAMP) AS ageMinutes
+   FROM orders
+   WHERE id = X;
+
+   SELECT orderId, generation, processingRun, source, eventId, eventType, status,
+          failureReason, startedAt, completedAt, createdAt
+   FROM order_processing_runs
+   WHERE orderId = X
+   ORDER BY generation, processingRun;
+
+   SELECT eventId, eventType, requestId, attempts, publishedAt, createdAt
+   FROM outbox_events
+   WHERE eventType IN ('order.created', 'order.reprocess.requested')
+     AND JSON_EXTRACT(payload, '$.orderId') = X
+   ORDER BY id DESC;
+
+   COMMIT;
+   ```
+
+3. Interprete os registros e timestamps:
+   - `PENDING` com tentativa `PENDING` e `startedAt IS NULL`: ainda não houve início válido do consumer. Se a outbox estiver ausente ou `publishedAt IS NULL`, investigue dispatcher, falhas de publicação e conectividade do broker.
+   - `publishedAt` significa que o dispatcher recebeu publisher confirm e atualizou o banco; não prova que o consumer terminou. Compare filas, consumers e logs.
+   - `outbox_events.attempts` conta falhas de publicação registradas, não entregas RabbitMQ nem confirmações bem-sucedidas. `order_outbox_publication_attempts_total` mede tentativas do dispatcher.
+   - `startedAt` indica que uma entrega válida iniciou a execução; retries não reiniciam esse timestamp. `completedAt` e estado terminal indicam resultado persistido. `failureReason` explica execução `FAILED`.
+   - Considere sempre o par atual `generation`/`processingRun`; mensagens anteriores podem estar obsoletas após reprocessamento.
+4. No RabbitMQ Management, entre em <http://localhost:15672>, escolha o vhost `/` e abra **Queues and Streams**. Examine `order.created`, `order.created.retry.1`, `.retry.2`, `.retry.3` e `order.created.dlq`. `Ready` são mensagens aguardando entrega; `Unacked` foram entregues e ainda não confirmadas; `Consumers` indica workers conectados. `Ready` crescente com zero consumers sugere problema de worker/conexão; `Unacked` parado pode indicar processamento suspenso/demorado; retry crescente aponta falha transitória; conteúdo na DLQ exige investigação da falha permanente ou esgotamento dos retries.
+5. Pesquise logs locais pelo request ID do header HTTP ou pelos IDs do pedido/evento/execução. Os comandos abaixo filtram os logs recentes sem cor:
+
+   ```bash
+   docker compose logs --since 30m --no-color api | grep -F '"requestId":"<uuid>"'
+   docker compose logs --since 30m --no-color api | grep -F '"eventId":"<uuid>"'
+   ```
+
+   No Grafana **Explore**, escolha Loki e filtre structured metadata, por exemplo `{job="order-api"} | requestId="<uuid>"`; também é possível filtrar `eventId`/`orderId`. Em Tempo, procure o atributo `request.id` para abrir o trace e seus spans. Sem `requestId` em evento antigo, correlacione por `eventId`, IDs da execução e timestamps; não presuma que eventos legados têm trace.
+6. Consulte o dashboard ou Prometheus: `order_outbox_pending`, `order_outbox_oldest_pending_age_seconds`, `order_outbox_publication_attempts_total`, `order_processing_results_total`, `order_consumer_results_total`, `rabbitmq_detailed_queue_messages_ready`, `rabbitmq_detailed_queue_messages_unacked` e `rabbitmq_detailed_queue_consumers`. Use as regras em <http://localhost:9090/alerts> como sinais, não como prova isolada da causa.
+7. Mantenha a inspeção do Management somente leitura. Não use **Get messages**, ack, requeue, purge ou alteração de bindings para diagnosticar: a ação pode consumir mensagem, alterar ordem, duplicar processamento ou apagar evidência. Não faça `nack` manual nem republique/remova linhas da outbox. Para um pedido já `FAILED`, após corrigir a causa, use `POST /orders/:id/reprocess` com role `order-admin`. Esse endpoint não consome nem altera diretamente mensagens da DLQ; intervenções na DLQ exigem procedimento operacional revisado.
+
+### Migrations e execução sem Docker
+
+O Compose executa migrations antes da API. `synchronize` não é usado em produção. Para reaplicar a migration do serviço `migrate` manualmente:
+
+```bash
+docker compose run --rm migrate
+```
+
+Fora do Docker, depois de configurar a conexão do banco e compilar a aplicação, execute as migrations pelo datasource compilado:
+
+```bash
+npm run build
+npm run migration:run
+```
+
+Não execute `migration:revert` sem avaliar impacto, backup e plano de recuperação. A migration de histórico faz backfill inicial sem remover colunas antigas; em deploy progressivo, binários antigos podem criar pedidos sem gravar linhas de execução. Após drenar instâncias antigas, faça reconciliação idempotente antes de considerar a auditoria completa. Em bases grandes, planeje backup e monitore duração e locks; o `down` da migration de histórico remove a tabela e descarta esses registros.
+
+Para iniciar a API fora dos containers, instale dependências, copie o arquivo de ambiente e use `DB_HOST=localhost` com os serviços necessários disponíveis:
+
+```bash
+npm ci --legacy-peer-deps
+cp .env.example .env
+npm run start:dev
+```
+
+Os testes unitários/E2E usam `DB_TYPE=better-sqlite3`, `DB_NAME=:memory:` e `RABBITMQ_ENABLED=false`; execução de desenvolvimento com processamento real depende de MySQL e RabbitMQ acessíveis.
+
+### Troubleshooting rápido
+
+| Sintoma | Verificações e ação segura |
+| --- | --- |
+| API não inicia | Consulte `docker compose logs migrate api`; confirme MySQL/RabbitMQ saudáveis e se a migration terminou com sucesso. |
+| Porta ocupada | Altere `API_PORT`, `MYSQL_PORT`, `RABBITMQ_PORT` ou `RABBITMQ_MANAGEMENT_PORT` no `.env` e valide com `docker compose config --quiet`. |
+| Migration já aplicada | Normal: TypeORM registra migrations aplicadas na tabela `migrations`. Não apague o histórico para forçar execução. |
+| Serviço não saudável | Verifique `docker compose ps` e os logs do serviço; confirme disponibilidade de recursos e credenciais locais. |
+| Swagger retorna `401` | Confirme `AUTH_ENABLED`, token Bearer, `iss`, `aud`, expiração e disponibilidade/issuer do JWKS. |
+| Swagger retorna `403` | O token foi validado, mas não contém a client role necessária em `resource_access.order-api.roles`. |
+| Pedido `FAILED` novamente após reprocessar | Consulte `failureReason`, histórico e estoque; reprocessar não corrige a causa de negócio. |
+
+### Limitações operacionais conhecidas
+
+- A outbox não tem mecanismo distribuído de claim/lease; múltiplas réplicas do dispatcher podem publicar o mesmo evento. O consumer tolera redelivery, mas escala horizontal de dispatchers exige coordenação adicional.
+- O profile local avalia regras Prometheus, mas não envia notificações. Traces são exportados apenas quando `OTEL_EXPORTER_OTLP_ENDPOINT` está configurado; consultas SQL/TypeORM não são instrumentadas.
+- Retries têm atrasos fixos, e falha de publicação da outbox é tentada novamente no próximo ciclo. Não há ferramenta de replay da DLQ nem rotina de retenção/limpeza da outbox documentada.
+- O histórico de execução é persistido, mas não há endpoint de consulta específico para `order_processing_runs`.
+- A configuração Compose padrão inicia sem autenticação por escolha explícita para desenvolvimento local. Produção exige Keycloak e HTTPS; disponibilidade, realm e configuração do provedor são responsabilidade do ambiente consumidor.

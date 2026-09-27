@@ -23,12 +23,18 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management
+    command:
+      [
+        'sh',
+        '-c',
+        'rabbitmq-plugins enable --offline rabbitmq_prometheus && exec rabbitmq-server',
+      ]
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-app}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-app}
     ports:
-      - '${RABBITMQ_PORT:-5672}:5672'
-      - '${RABBITMQ_MANAGEMENT_PORT:-15672}:15672'
+      - '127.0.0.1:${RABBITMQ_PORT:-5672}:5672'
+      - '127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672'
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -77,8 +83,11 @@ services:
       DB_NAME: ${MYSQL_DATABASE:-order_db}
       RABBITMQ_ENABLED: 'true'
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      OTEL_SERVICE_NAME: order-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     ports:
-      - '${API_PORT:-3000}:3000'
+      - '127.0.0.1:${API_PORT:-3000}:3000'
     healthcheck:
       test:
         [
@@ -158,6 +167,95 @@ services:
       rabbitmq-test:
         condition: service_healthy
 
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ['observability']
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    ports:
+      - '127.0.0.1:9090:9090'
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    profiles: ['observability']
+    command: ['-config.file=/etc/tempo/tempo.yml']
+    ports:
+      - '127.0.0.1:3200:3200'
+    volumes:
+      - ./observability/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo_data:/var/tempo
+
+  loki:
+    image: grafana/loki:3.3.2
+    profiles: ['observability']
+    command: ['-config.file=/etc/loki/loki.yml']
+    ports:
+      - '127.0.0.1:3101:3100'
+    volumes:
+      - ./observability/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.5.1
+    profiles: ['observability']
+    command:
+      - 'run'
+      - '--server.http.listen-addr=0.0.0.0:12345'
+      - '/etc/alloy/config.alloy'
+    environment:
+      DOCKER_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-order-api}
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Alloy discovers only this Compose project's API container.
+      # This Docker socket grants elevated control of the local Docker daemon.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      - loki
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    profiles: ['observability']
+    command: ['--config=/etc/otelcol-contrib/config.yml']
+    volumes:
+      - ./observability/otel-collector/config.yml:/etc/otelcol-contrib/config.yml:ro
+    depends_on:
+      - tempo
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ['observability']
+    ports:
+      - '127.0.0.1:3001:3000'
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
 volumes:
   mysql_data:
   rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+  tempo_data:
+  loki_data:
+  alloy_data:

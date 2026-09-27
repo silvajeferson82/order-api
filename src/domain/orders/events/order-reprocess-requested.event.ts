@@ -8,5 +8,6 @@ export class OrderReprocessRequestedEvent implements DomainEvent {
     readonly orderId: number,
     readonly generation: number,
     readonly processingRun: number,
+    readonly requestId?: string,
   ) {}
 }

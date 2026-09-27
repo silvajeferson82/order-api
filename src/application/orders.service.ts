@@ -12,6 +12,8 @@ import type { Order, OrderStatus } from '../domain/orders/order';
 import type { CreateOrderCommand } from './orders/create-order.command';
 import { OrderCreatedEvent } from '../domain/orders/events/order-created.event';
 import { OrderReprocessRequestedEvent } from '../domain/orders/events/order-reprocess-requested.event';
+import { requestContext } from '../observability/request-context';
+import { logEvent } from '../observability/json-logger';
 
 @Injectable()
 export class OrdersService {
@@ -55,29 +57,45 @@ export class OrdersService {
       processingRun: 1,
       items: command.items.map((item) => ({ ...item })),
     });
-    return this.orderRepository.createWithEvent(
+    const saved = await this.orderRepository.createWithEvent(
       order,
       (savedOrder) =>
         new OrderCreatedEvent(
           savedOrder.id,
           savedOrder.generation,
           savedOrder.processingRun,
+          requestContext.current()?.requestId,
         ),
       requestedBy,
     );
+    logEvent('info', 'order.create.accepted', {
+      orderId: saved.id,
+      generation: saved.generation,
+      processingRun: saved.processingRun,
+      eventType: 'order.created',
+    });
+    return saved;
   }
 
   async reprocess(id: number, requestedBy?: string | null): Promise<Order> {
-    return this.orderRepository.reprocessFailed(
+    const saved = await this.orderRepository.reprocessFailed(
       id,
       (savedOrder) =>
         new OrderReprocessRequestedEvent(
           savedOrder.id,
           savedOrder.generation,
           savedOrder.processingRun,
+          requestContext.current()?.requestId,
         ),
       requestedBy,
     );
+    logEvent('info', 'order.reprocess.accepted', {
+      orderId: saved.id,
+      generation: saved.generation,
+      processingRun: saved.processingRun,
+      eventType: 'order.reprocess.requested',
+    });
+    return saved;
   }
 
   async findAll(

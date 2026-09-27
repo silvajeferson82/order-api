@@ -9,6 +9,7 @@ import { ProductEntity } from './infrastructure/database/entities/product.entity
 import { OutboxEventEntity } from './infrastructure/database/entities/outbox-event.entity';
 import { OrderProcessingRunEntity } from './infrastructure/database/entities/order-processing-run.entity';
 import { OrdersModule } from './modules/orders.module';
+import { ObservabilityModule } from './observability/observability.module';
 
 @Module({
   imports: [
@@ -76,6 +77,7 @@ import { OrdersModule } from './modules/orders.module';
       },
     }),
     OrdersModule,
+    ObservabilityModule,
   ],
 })
 export class AppModule {}

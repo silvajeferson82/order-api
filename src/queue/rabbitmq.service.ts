@@ -7,6 +7,8 @@ import {
 import { ConfigService } from '@nestjs/config';
 import type { ConfirmChannel, ChannelModel } from 'amqplib';
 import type { DomainEvent } from '../domain/orders/events/domain-event';
+import { propagation, context } from '@opentelemetry/api';
+import { logEvent } from '../observability/json-logger';
 
 @Injectable()
 export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
@@ -46,13 +48,17 @@ export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
       connection = await amqp.connect(this.url);
       this.connection = connection;
       connection.on('error', (error: Error) => {
-        this.logger.error(`Conexão RabbitMQ: ${error.message}`);
+        logEvent('error', 'rabbitmq.connection.error', {
+          errorType: error.name,
+        });
       });
       connection.on('close', () => this.handleDisconnect());
       const channel = await connection.createConfirmChannel();
       this.channel = channel;
       channel.on('error', (error: Error) => {
-        this.logger.error(`Canal RabbitMQ: ${error.message}`);
+        logEvent('error', 'rabbitmq.channel.error', {
+          errorType: error.name,
+        });
       });
       channel.on('close', () => this.handleDisconnect());
       await channel.assertExchange('order.created.dlq', 'fanout', {
@@ -79,9 +85,10 @@ export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
       this.channel = null;
       this.connection = null;
       if (connection) await connection.close().catch(() => undefined);
-      this.logger.error(
-        `Conexão RabbitMQ indisponível: ${messageOf(error)}; haverá nova tentativa.`,
-      );
+      logEvent('error', 'rabbitmq.connection.unavailable', {
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+        reconnectInSeconds: 2,
+      });
       this.scheduleReconnect();
     } finally {
       this.connecting = false;
@@ -92,7 +99,9 @@ export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
     this.consumers.push(register);
     if (this.channel) {
       void register(this.channel).catch((error: unknown) => {
-        this.logger.error(`Falha ao registrar consumer: ${messageOf(error)}`);
+        logEvent('error', 'rabbitmq.consumer.registration_failed', {
+          errorType: error instanceof Error ? error.name : 'UnknownError',
+        });
       });
     }
   }
@@ -120,12 +129,25 @@ export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
     if (!this.channel) {
       throw new Error('RabbitMQ indisponível para publicação do evento');
     }
+    const headers: Record<string, unknown> = {
+      ...(event.eventId ? { eventId: event.eventId } : {}),
+      ...(event.requestId ? { requestId: event.requestId } : {}),
+    };
+    propagation.inject(context.active(), headers);
     this.channel.sendToQueue(
       'order.created',
       Buffer.from(JSON.stringify(event)),
-      { persistent: true, contentType: 'application/json' },
+      { persistent: true, contentType: 'application/json', headers },
     );
     await this.channel.waitForConfirms();
+    logEvent('info', 'outbox.event.published', {
+      eventId: event.eventId,
+      requestId: event.requestId,
+      orderId: event.orderId,
+      generation: event.generation,
+      processingRun: event.processingRun,
+      eventType: event.eventType,
+    });
   }
 
   async publishRetry(
@@ -134,10 +156,12 @@ export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
     headers: Record<string, unknown>,
   ): Promise<void> {
     if (!this.channel) throw new Error('RabbitMQ indisponível para retry');
+    const propagationHeaders: Record<string, unknown> = { ...headers };
+    propagation.inject(context.active(), propagationHeaders);
     this.channel.sendToQueue(retryQueue, content, {
       persistent: true,
       contentType: 'application/json',
-      headers,
+      headers: propagationHeaders,
     });
     await this.channel.waitForConfirms();
   }
@@ -153,8 +177,4 @@ export class OrderQueuePublisher implements OnModuleInit, OnModuleDestroy {
     await channel?.close().catch(() => undefined);
     await connection?.close().catch(() => undefined);
   }
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : 'erro desconhecido';
 }

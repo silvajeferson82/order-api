@@ -1,0 +1,68 @@
+groups:
+  - name: order-api
+    rules:
+      - alert: OrderOutboxPendingTooOld
+        expr: order_outbox_oldest_pending_age_seconds > 600
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Evento da outbox pendente há mais de 10 minutos
+          description: Verifique conectividade do dispatcher com RabbitMQ e os eventos pendentes no MySQL.
+
+      - alert: OrderOutboxBacklog
+        expr: order_outbox_pending > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Acúmulo de eventos pendentes na outbox
+          description: A outbox contém mais de 100 eventos não publicados por cinco minutos.
+
+      - alert: OrderCreatedQueueBacklog
+        expr: rabbitmq_detailed_queue_messages_ready{queue="order.created"} > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Fila principal de pedidos acumulando mensagens
+          description: Verifique consumidores, unacked e erros do worker.
+
+      - alert: OrderDeadLetterQueueHasMessages
+        expr: rabbitmq_detailed_queue_messages{queue="order.created.dlq"} > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Existem mensagens na DLQ de pedidos
+          description: Inspecione os metadados antes de decidir qualquer recuperação manual.
+
+      - alert: OrderProcessingFailureRateHigh
+        expr: |
+          sum(rate(order_processing_results_total{status="FAILED"}[5m]))
+          /
+          clamp_min(sum(rate(order_processing_results_total[5m])), 0.001) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Taxa de falhas de processamento acima de 10%
+          description: Consulte logs por requestId/eventId e o histórico persistido de execução.
+
+      - alert: RabbitMQExporterDown
+        expr: up{job="rabbitmq"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Scrape do RabbitMQ indisponível
+          description: Verifique broker, plugin rabbitmq_prometheus e endpoint interno 15692.
+
+      - alert: OrderApiScrapeDown
+        expr: up{job="order-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Endpoint de métricas da API indisponível
+          description: Verifique a API, o token de scrape em produção e a conectividade de rede.

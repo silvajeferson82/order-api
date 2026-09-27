@@ -54,6 +54,7 @@ describe('OutboxDispatcherService', () => {
         orderId: 7,
         generation: 1,
         processingRun: 1,
+        eventId: 'event-7',
       }),
     );
     expect(outbox.update).toHaveBeenCalledTimes(1);
@@ -94,5 +95,32 @@ describe('OutboxDispatcherService', () => {
 
     expect(outbox.update).not.toHaveBeenCalled();
     expect(outbox.increment).toHaveBeenCalledWith({ id: 7 }, 'attempts', 1);
+  });
+
+  it('publica requestId persistido junto com o eventId sem expor payload além do contrato', async () => {
+    outbox.find.mockResolvedValue([
+      {
+        ...event,
+        requestId: '123e4567-e89b-12d3-a456-426614174000',
+        payload: {
+          eventType: 'order.created',
+          version: 1,
+          orderId: 7,
+          generation: 1,
+          processingRun: 1,
+          eventId: 'event-7',
+          requestId: '123e4567-e89b-12d3-a456-426614174000',
+        },
+      },
+    ]);
+
+    await dispatcher.dispatchPending();
+
+    expect(publisher.publishDomainEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: 'event-7',
+        requestId: '123e4567-e89b-12d3-a456-426614174000',
+      }),
+    );
   });
 });

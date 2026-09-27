@@ -44,6 +44,8 @@ export function validateConfiguration(config: Record<string, unknown>) {
   }
 
   const production = nodeEnv === 'production';
+  const metricsToken =
+    typeof config.METRICS_TOKEN === 'string' ? config.METRICS_TOKEN : '';
   const requireHttps = nodeEnv !== 'development' && nodeEnv !== 'test';
   const authEnabled =
     authRaw === undefined ? true : authRaw === true || authRaw === 'true';
@@ -82,6 +84,7 @@ export function validateConfiguration(config: Record<string, unknown>) {
     ...config,
     RABBITMQ_ENABLED: enabled,
     AUTH_ENABLED: authEnabled,
+    ...(metricsToken ? { METRICS_TOKEN: metricsToken } : {}),
     JWKS_CACHE_TTL_MS: jwksCacheTtl,
     JWKS_TIMEOUT_MS: jwksTimeout,
     JWKS_RATE_LIMIT: jwksRateLimit,
@@ -93,6 +96,12 @@ export function validateConfiguration(config: Record<string, unknown>) {
       throw new Error('Autenticação JWT é obrigatória em produção');
     }
     return result;
+  }
+
+  if (production && metricsToken.length < 32) {
+    throw new Error(
+      'METRICS_TOKEN com pelo menos 32 caracteres é obrigatório em produção',
+    );
   }
 
   const issuer = readRequiredString(config.KEYCLOAK_ISSUER, 'KEYCLOAK_ISSUER');

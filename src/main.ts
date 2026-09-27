@@ -17,6 +17,15 @@ async function bootstrap() {
     .setTitle('Order API')
     .setDescription('API de pedidos com processamento assíncrono')
     .setVersion('1.0')
+    .addBearerAuth(
+      {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT',
+        description: 'Access token Keycloak assinado com RS256',
+      },
+      'bearer',
+    )
     .build();
 
   const document = SwaggerModule.createDocument(app, config);
